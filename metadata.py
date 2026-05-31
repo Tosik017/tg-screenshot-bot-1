@@ -1,4 +1,4 @@
-import httpx, json, random
+import httpx, json
 from selectolax.parser import HTMLParser
 from loguru import logger
 
@@ -18,10 +18,7 @@ async def fetch(url: str) -> dict:
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "uk,ru;q=0.9,en;q=0.8",
             }
-            async with httpx.AsyncClient(
-                follow_redirects=True,
-                timeout=8
-            ) as client:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=8) as client:
                 r = await client.get(url, headers=headers)
             result = _parse(r.text, url)
             if result.get("title"):
@@ -84,28 +81,35 @@ def _parse(html: str, url: str) -> dict:
                     if rv:
                         result["rating"] = f"⭐ {rv}"
                         if rc:
-                            result["rating"] += f" ({rc} відгуків)"
+                            result["rating"] += f" \\({rc} відгуків\\)"
         except Exception:
             continue
 
     return result
 
+def _escape(text: str) -> str:
+    """Экранирование спецсимволов для MarkdownV2."""
+    chars = r"_*[]()~`>#+-=|{}.!"
+    for ch in chars:
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
 def format_card(meta: dict) -> str:
-    """Карточка БЕЗ ссылки — ссылка уже есть в оригинальном сообщении."""
+    """Карточка без ссылки, с экранированием для MarkdownV2."""
     lines = []
     if meta.get("site_name"):
-        lines.append(f"🌐 {meta['site_name']}")
+        lines.append(f"🌐 {_escape(meta['site_name'])}")
     if meta.get("title"):
-        lines.append(f"📌 {meta['title']}")
+        lines.append(f"📌 *{_escape(meta['title'])}*")
     if meta.get("brand"):
-        lines.append(f"🏷 {meta['brand']}")
+        lines.append(f"🏷 {_escape(meta['brand'])}")
     if meta.get("price"):
-        lines.append(f"💰 {meta['price']}")
+        lines.append(f"💰 *{_escape(str(meta['price']))}*")
     if meta.get("rating"):
         lines.append(meta["rating"])
     if meta.get("description"):
         desc = meta["description"]
         if len(desc) > 200:
             desc = desc[:200].rsplit(" ", 1)[0] + "…"
-        lines.append(f"\n{desc}")
+        lines.append(f"\n{_escape(desc)}")
     return "\n".join(lines)
