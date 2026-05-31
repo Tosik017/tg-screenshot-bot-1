@@ -1,6 +1,6 @@
 import re, time, asyncio
 from aiogram import Router
-from aiogram.types import Message, BufferedInputFile, MessageEntity
+from aiogram.types import Message, BufferedInputFile, MessageEntity, InputMediaPhoto
 from loguru import logger
 import cache, security, screenshot, metadata
 
@@ -77,15 +77,10 @@ def trim_caption(text: str, entities: list) -> tuple[str, list]:
     return text, entities
 
 def merge_meta(httpx_meta: dict, browser_meta: dict) -> dict:
-    """
-    Объединяем метаданные из httpx и браузера.
-    Браузер приоритетнее — он видит JS-рендер и реальный контент.
-    """
     result = {**httpx_meta}
     for key, value in browser_meta.items():
         if value and (key not in result or not result[key]):
             result[key] = value
-        # Для цены и рейтинга браузер всегда приоритетнее
         if key in ("price", "rating", "brand") and value:
             result[key] = value
     return result
@@ -104,6 +99,7 @@ async def handle(msg: Message):
         await msg.reply("🚫 Посилання веде на недоступний ресурс.")
         return
 
+    # Кэш
     cached_file_id = cache.get(url)
     if cached_file_id:
         meta = await metadata.fetch(url)
@@ -122,15 +118,13 @@ async def handle(msg: Message):
     status = await msg.reply(WARNING_INSTANT)
     start = time.monotonic()
 
-    # httpx и браузер параллельно
     httpx_task = asyncio.create_task(metadata.fetch(url))
     shot_task = asyncio.create_task(screenshot.shoot(url))
 
-    httpx_meta, (shot, browser_meta) = await asyncio.gather(httpx_task, shot_task)
+    httpx_meta, (parts, browser_meta) = await asyncio.gather(httpx_task, shot_task)
 
-    # Объединяем — браузер приоритетнее
     meta = merge_meta(httpx_meta, browser_meta)
-    logger.info(f"Final meta: title={meta.get('title')} price={meta.get('price')} brand={meta.get('brand')}")
+    logger.info(f"Final meta: title={meta.get('title')} price={meta.get('price')}")
 
     elapsed = time.monotonic() - start
 
@@ -140,17 +134,41 @@ async def handle(msg: Message):
         msg_text, msg_entities = build_disclaimer_only()
 
     try:
-        if shot:
+        if parts:
             cap_text, cap_entities = trim_caption(msg_text, msg_entities)
-            sent = await msg.reply_photo(
-                photo=BufferedInputFile(shot, filename="preview.png"),
-                caption=cap_text,
-                caption_entities=cap_entities,
-            )
-            if sent.photo:
-                cache.save(url, sent.photo[-1].file_id)
-            logger.info(f"OK+photo url={url} time={elapsed:.1f}s")
+
+            if len(parts) == 1:
+                # Одна часть — фото с карточкой
+                sent = await msg.reply_photo(
+                    photo=BufferedInputFile(parts[0], filename="preview.png"),
+                    caption=cap_text,
+                    caption_entities=cap_entities,
+                )
+                if sent.photo:
+                    cache.save(url, sent.photo[-1].file_id)
+            else:
+                # Несколько частей — медиагруппа
+                # Карточка идёт к первой части
+                media = []
+                for i, part in enumerate(parts):
+                    if i == 0:
+                        media.append(InputMediaPhoto(
+                            media=BufferedInputFile(part, filename=f"part_{i+1}.png"),
+                            caption=cap_text,
+                            caption_entities=cap_entities,
+                        ))
+                    else:
+                        media.append(InputMediaPhoto(
+                            media=BufferedInputFile(part, filename=f"part_{i+1}.png"),
+                        ))
+                sent_list = await msg.reply_media_group(media=media)
+                # Кэшируем первое фото
+                if sent_list and sent_list[0].photo:
+                    cache.save(url, sent_list[0].photo[-1].file_id)
+
+            logger.info(f"OK+photo parts={len(parts)} url={url} time={elapsed:.1f}s")
         else:
+            # Скриншот не получился — только карточка
             await msg.reply(text=msg_text, entities=msg_entities)
             logger.info(f"OK+text url={url} time={elapsed:.1f}s")
 
