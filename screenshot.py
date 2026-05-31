@@ -1,4 +1,6 @@
-import asyncio, math, os, psutil
+import asyncio, os, psutil
+from PIL import Image
+from io import BytesIO
 from playwright.async_api import async_playwright
 from playwright_stealth import stealth_async
 from loguru import logger
@@ -8,7 +10,6 @@ semaphore = asyncio.Semaphore(SEMAPHORE)
 _browser = None
 
 MOBILE_WIDTH = 390
-MOBILE_HEIGHT = 844
 PARTS = 4
 MAX_PAGE_HEIGHT = 16000
 
@@ -53,7 +54,7 @@ async def shoot(url: str) -> list[bytes]:
     log_ram("Before request")
     async with semaphore:
         ctx = await _browser.new_context(
-            viewport={"width": MOBILE_WIDTH, "height": MOBILE_HEIGHT},
+            viewport={"width": MOBILE_WIDTH, "height": 844},
             user_agent=USER_AGENT,
             device_scale_factor=2,
         )
@@ -68,61 +69,46 @@ async def shoot(url: str) -> list[bytes]:
             await page.wait_for_timeout(PAUSE_MS)
             await _close_cookies(page)
 
-            # Получаем реальную высоту страницы
-            page_height = await page.evaluate(
-                "document.documentElement.scrollHeight"
-            )
-            page_height = min(page_height, MAX_PAGE_HEIGHT)
-
-            # Защита: страница должна быть хотя бы 100px
-            if page_height < 100:
-                page_height = MOBILE_HEIGHT
-
-            part_height = math.ceil(page_height / PARTS)
-
-            screenshots = []
-            for i in range(PARTS):
-                y = i * part_height
-
-                # Не выходим за границы
-                if y >= page_height:
-                    break
-
-                # Высота этой части — не больше чем осталось
-                h = min(part_height, page_height - y)
-
-                # Защита: пропускаем если высота меньше 10px
-                if h < 10:
-                    break
-
-                await page.evaluate(f"window.scrollTo(0, {y})")
-                await page.wait_for_timeout(300)
-
-                try:
-                    shot = await page.screenshot(
-                        full_page=False,
-                        clip={
-                            "x": 0,
-                            "y": y,
-                            "width": MOBILE_WIDTH,
-                            "height": h
-                        }
-                    )
-                    screenshots.append(shot)
-                except Exception as e:
-                    logger.warning(f"Part {i+1} skipped: {e}")
-                    continue
-
-            # Если ни одного скриншота не получили — делаем один общий
-            if not screenshots:
-                shot = await page.screenshot(full_page=False)
-                screenshots.append(shot)
-
+            # Получаем полную страницу одним снимком — как Web-Screenshot-Bot
+            full_png = await page.screenshot(full_page=True)
             log_ram("After screenshot")
-            return screenshots
+
+            # Нарезаем готовое изображение через Pillow — никаких координат браузера
+            return _split_image(full_png, PARTS, MAX_PAGE_HEIGHT)
 
         finally:
             await ctx.close()
+
+def _split_image(png_bytes: bytes, parts: int, max_height: int) -> list[bytes]:
+    """
+    Нарезает PNG на равные части по высоте.
+    Работает с готовым изображением — никаких проблем с координатами.
+    """
+    img = Image.open(BytesIO(png_bytes))
+    width, height = img.size
+
+    # Ограничение высоты
+    if height > max_height:
+        img = img.crop((0, 0, width, max_height))
+        height = max_height
+
+    part_height = height // parts
+    result = []
+
+    for i in range(parts):
+        top = i * part_height
+        bottom = top + part_height if i < parts - 1 else height
+
+        # Пропускаем пустые части
+        if top >= height:
+            break
+
+        part = img.crop((0, top, width, bottom))
+        buf = BytesIO()
+        part.save(buf, format="PNG")
+        result.append(buf.getvalue())
+
+    return result
 
 async def _close_cookies(page):
     for sel in COOKIE_SELECTORS:
