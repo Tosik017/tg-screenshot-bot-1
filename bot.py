@@ -1,7 +1,6 @@
 import re, time, asyncio
 from aiogram import Router
-from aiogram.types import Message, BufferedInputFile
-from aiogram.utils.formatting import Text, Bold, Code, BlockQuote, as_section, as_line
+from aiogram.types import Message, BufferedInputFile, MessageEntity
 from loguru import logger
 import cache, security, screenshot, metadata
 
@@ -14,57 +13,83 @@ WARNING_INSTANT = (
     "Зачекайте — я покажу що там є, без ризику для вас."
 )
 
-def build_caption(meta: dict) -> tuple[str, list]:
+DISCLAIMER = (
+    "🛡 УВАГА! Це автоматичний попередній перегляд.\n"
+    "❗ Не вводьте паролі та дані картки на незнайомих сайтах.\n"
+    "🔍 Краще знайдіть цей товар через пошук Google."
+)
+
+def build_message(meta: dict) -> tuple[str, list[MessageEntity]]:
     """
-    Повертає (text, entities) для відправки з форматуванням.
-    Використовуємо aiogram formatting API.
+    Будує текст + entities вручну.
+    Code для назви — виділяє в рамку і дозволяє копіювати одним тапом.
+    BlockQuote для попередження.
     """
-    content = []
+    text = ""
+    entities = []
 
     if meta.get("site_name"):
-        content.append(as_line("🌐 ", meta["site_name"]))
+        text += f"🌐 {meta['site_name']}\n"
 
-    # Назва — жирний текст для виділення
+    # Назва в CODE — рамка + копіювання одним тапом
     if meta.get("title"):
-        content.append(as_line(Bold("📌 " + meta["title"])))
+        title = meta["title"]
+        prefix = "📌 "
+        text += prefix
+        start = len(text.encode("utf-16-le")) // 2
+        text += title + "\n"
+        end = len(text.encode("utf-16-le")) // 2 - 1  # -1 за \n
+        entities.append(MessageEntity(
+            type="code",
+            offset=start,
+            length=end - start
+        ))
 
     if meta.get("brand"):
-        content.append(as_line("🏷 Бренд: ", meta["brand"]))
+        text += f"🏷 Бренд: {meta['brand']}\n"
 
+    # Ціна жирна
     if meta.get("price"):
-        content.append(as_line(Bold("💰 Ціна: " + str(meta["price"]))))
+        price_str = f"💰 Ціна: {meta['price']}"
+        start = len(text.encode("utf-16-le")) // 2
+        text += price_str + "\n"
+        end = len(text.encode("utf-16-le")) // 2 - 1
+        entities.append(MessageEntity(
+            type="bold",
+            offset=start,
+            length=end - start
+        ))
 
     if meta.get("rating"):
-        content.append(as_line(meta["rating"]))
+        text += f"{meta['rating']}\n"
 
     if meta.get("description"):
         desc = meta["description"].strip()
         if len(desc) > 300:
             desc = desc[:300].rsplit(" ", 1)[0] + "…"
-        content.append(Text("\n📝 " + desc))
+        text += f"\n📝 {desc}\n"
 
-    # Предупреждение цитатой
-    disclaimer = (
-        "🛡 УВАГА! Це автоматичний попередній перегляд.\n"
-        "❗ Не вводьте паролі та дані картки на незнайомих сайтах.\n"
-        "🔍 Краще знайдіть цей товар через пошук Google."
-    )
-    content.append(Text("\n"))
-    content.append(BlockQuote(disclaimer))
+    # Відступ перед попередженням
+    text += "\n"
 
-    result = as_section(*content)
-    return result.render()
+    # Попередження — blockquote
+    start = len(text.encode("utf-16-le")) // 2
+    text += DISCLAIMER
+    end = len(text.encode("utf-16-le")) // 2
+    entities.append(MessageEntity(
+        type="blockquote",
+        offset=start,
+        length=end - start
+    ))
 
-def build_disclaimer_only() -> tuple[str, list]:
-    """Тільки попередження якщо метаданих немає."""
-    disclaimer = (
-        "ℹ️ Не вдалось отримати дані про сторінку.\n\n"
-        "🛡 УВАГА! Це автоматичний попередній перегляд.\n"
-        "❗ Не вводьте паролі та дані картки на незнайомих сайтах.\n"
-        "🔍 Краще знайдіть цей товар через пошук Google."
-    )
-    result = BlockQuote(disclaimer)
-    return result.render()
+    return text, entities
+
+def build_disclaimer_only() -> tuple[str, list[MessageEntity]]:
+    text = "ℹ️ Не вдалось отримати дані про сторінку.\n\n" + DISCLAIMER
+    start = len("ℹ️ Не вдалось отримати дані про сторінку.\n\n".encode("utf-16-le")) // 2
+    end = len(text.encode("utf-16-le")) // 2
+    entities = [MessageEntity(type="blockquote", offset=start, length=end - start)]
+    return text, entities
 
 @router.message()
 async def handle(msg: Message):
@@ -80,52 +105,49 @@ async def handle(msg: Message):
         await msg.reply("🚫 Посилання веде на недоступний ресурс.")
         return
 
-    # Кэш
     cached = cache.get(url)
     if cached:
         await msg.reply_photo(cached)
         return
 
-    # Моментальное предупреждение
     status = await msg.reply(WARNING_INSTANT)
     start = time.monotonic()
 
-    # Параллельно: метаданные + скриншот
     meta_task = asyncio.create_task(metadata.fetch(url))
     shot_task = asyncio.create_task(screenshot.shoot(url))
     meta, shot = await asyncio.gather(meta_task, shot_task)
 
     elapsed = time.monotonic() - start
 
-    # Строим форматированный текст
     if meta and meta.get("title"):
-        formatted_text, entities = build_caption(meta)
+        msg_text, msg_entities = build_message(meta)
     else:
-        formatted_text, entities = build_disclaimer_only()
-
-    # Обрезаем caption до лимита Telegram (1024 для фото, 4096 для текста)
-    if len(formatted_text) > 1024:
-        formatted_text = formatted_text[:1020] + "…"
-        entities = [e for e in entities if e.offset + e.length <= 1020]
+        msg_text, msg_entities = build_disclaimer_only()
 
     try:
         if shot:
+            # Caption limit = 1024
+            cap_text = msg_text
+            cap_entities = msg_entities
+            if len(cap_text) > 1024:
+                cap_text = cap_text[:1021] + "…"
+                cap_entities = [
+                    e for e in cap_entities
+                    if e.offset + e.length <= len(cap_text.encode("utf-16-le")) // 2
+                ]
+
             sent = await msg.reply_photo(
                 photo=BufferedInputFile(shot, filename="preview.png"),
-                caption=formatted_text,
-                caption_entities=entities,
+                caption=cap_text,
+                caption_entities=cap_entities,
             )
             if sent.photo:
                 cache.save(url, sent.photo[-1].file_id)
             logger.info(f"OK+photo url={url} time={elapsed:.1f}s")
         else:
-            # Скриншота нет — отправляем текст (лимит 4096)
-            full_text = formatted_text
-            if len(full_text) > 4096:
-                full_text = full_text[:4092] + "…"
             await msg.reply(
-                text=full_text,
-                entities=entities,
+                text=msg_text,
+                entities=msg_entities,
             )
             logger.info(f"OK+text url={url} time={elapsed:.1f}s")
 
