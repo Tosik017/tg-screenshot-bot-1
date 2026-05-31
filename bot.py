@@ -3,7 +3,7 @@ from aiogram import Router
 from aiogram.types import Message, BufferedInputFile
 from aiogram.utils.media_group import MediaGroupBuilder
 from loguru import logger
-import security, screenshot
+import cache, security, screenshot
 
 router = Router()
 URL_RE = re.compile(r'https?://[^\s]+')
@@ -14,42 +14,37 @@ async def handle(msg: Message):
     urls = URL_RE.findall(text)
     if not urls:
         return
-
     url = urls[0]
-    
-    # 1. Замеряем память на старте (берем функцию из screenshot.py)
-    screenshot.log_ram("Start Request")
-
+    screenshot.log_ram("Start request")
     if not security.is_safe(url):
         await msg.reply("🚫 Ссылка ведёт на недоступный ресурс.")
         return
-
-    status = await msg.reply("📸 Создаю превью (мобильный формат, 4 части)...")
+    cached = cache.get(url)
+    if cached:
+        await msg.reply_photo(cached)
+        return
+    status = await msg.reply("📸 Создаю превью...")
     start = time.monotonic()
-
     try:
-        # 2. Получаем список из 4 картинок
-        data_list = await screenshot.shoot(url)
-        
-        # 3. Собираем картинки в альбом (MediaGroup)
+        parts = await screenshot.shoot(url)
         album = MediaGroupBuilder()
-        for i, data in enumerate(data_list):
-            album.add_photo(BufferedInputFile(data, filename=f"part_{i}.png"))
-        
-        # Отправляем альбом пользователю
-        await msg.reply_media_group(media=album.build())
-
+        for i, data in enumerate(parts):
+            album.add_photo(
+                BufferedInputFile(data, filename=f"part_{i+1}.png")
+            )
+        sent_list = await msg.reply_media_group(media=album.build())
+        if sent_list and sent_list[0].photo:
+            cache.save(url, sent_list[0].photo[-1].file_id)
         elapsed = time.monotonic() - start
-        logger.info(f"OK url={url} time={elapsed:.1f}s")
-        
-        # 4. Замеряем память после успешного рендера
-        screenshot.log_ram("After Render")
-
+        total_kb = sum(len(p) for p in parts) // 1024
+        screenshot.log_ram("After render")
+        logger.info(
+            f"OK url={url} parts={len(parts)} "
+            f"time={elapsed:.1f}s size={total_kb}kb"
+        )
     except Exception as e:
-        # Замеряем память перед возможным падением бота
-        screenshot.log_ram("After Render (Error)")
+        screenshot.log_ram("After render (error)")
         logger.error(f"FAIL url={url} error={e}")
         await status.edit_text("❌ Не удалось сделать скриншот.")
         return
-
     await status.delete()
