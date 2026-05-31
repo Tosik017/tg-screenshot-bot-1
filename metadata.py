@@ -22,7 +22,7 @@ async def fetch(url: str) -> dict:
                 r = await client.get(url, headers=headers)
             result = _parse(r.text, url)
             if result.get("title"):
-                logger.info(f"Metadata OK ua={ua[:30]} url={url}")
+                logger.info(f"Metadata OK ua={ua[:30]} url={url} data={result}")
                 return result
         except Exception as e:
             logger.warning(f"Metadata attempt failed ua={ua[:30]}: {e}")
