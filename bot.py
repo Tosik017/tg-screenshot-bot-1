@@ -7,20 +7,18 @@ import cache, security, screenshot, metadata
 router = Router()
 URL_RE = re.compile(r'https?://[^\s]+')
 
-# Моментальное предупреждение — без MarkdownV2, просто текст
 WARNING = (
     "🚨 СТОП! Не переходьте за посиланням!\n\n"
     "⏳ Генерую безпечний попередній перегляд...\n"
     "Зачекайте — я покажу що там є, без ризику для вас."
 )
 
-# Дисклеймер под превью — тоже простой текст
 DISCLAIMER = (
-    "\n\n"
+    "\n"
     "━━━━━━━━━━━━━━━\n"
-    "🛡 Автоматичний попередній перегляд\n"
-    "Перевіряйте адресу сайту перед покупкою або введенням даних. "
-    "За потреби знайдіть цей товар через пошук Google."
+    "🛡 УВАГА! Це автоматичний попередній перегляд.\n"
+    "❗ Не вводьте паролі та дані картки на незнайомих сайтах.\n"
+    "🔍 Краще знайдіть цей товар через пошук Google."
 )
 
 @router.message()
@@ -37,22 +35,34 @@ async def handle(msg: Message):
         await msg.reply("🚫 Посилання веде на недоступний ресурс.")
         return
 
+    # Кэш
     cached = cache.get(url)
     if cached:
         await msg.reply_photo(cached)
         return
 
-    # Моментально показываем предупреждение
+    # Моментальное предупреждение
     status = await msg.reply(WARNING)
     start = time.monotonic()
 
-    # Параллельно грузим всё
+    # Параллельно: метаданные + скриншот
     meta_task = asyncio.create_task(metadata.fetch(url))
     shot_task = asyncio.create_task(screenshot.shoot(url))
     meta, shot = await asyncio.gather(meta_task, shot_task)
 
     card = metadata.format_card(meta)
-    caption = (card + DISCLAIMER) if card else DISCLAIMER.strip()
+
+    # Caption = карточка (если есть) + предупреждение
+    # Telegram ограничивает caption до 1024 символов
+    if card:
+        caption = card + DISCLAIMER
+    else:
+        caption = "ℹ️ Не вдалось отримати дані про сторінку." + DISCLAIMER
+
+    # Обрезаем если слишком длинно
+    if len(caption) > 1024:
+        caption = caption[:1020] + "…"
+
     elapsed = time.monotonic() - start
 
     try:
@@ -65,6 +75,7 @@ async def handle(msg: Message):
                 cache.save(url, sent.photo[-1].file_id)
             logger.info(f"OK+photo url={url} time={elapsed:.1f}s")
         else:
+            # Скриншот не получился — только текст
             await msg.reply(caption)
             logger.info(f"OK+text url={url} time={elapsed:.1f}s")
 

@@ -56,6 +56,7 @@ def _parse(html: str, url: str) -> dict:
         if node:
             result["title"] = node.text(strip=True)
 
+    # JSON-LD — цена, бренд, рейтинг для товаров
     for node in tree.css('script[type="application/ld+json"]'):
         try:
             data = json.loads(node.text())
@@ -88,20 +89,35 @@ def _parse(html: str, url: str) -> dict:
     return result
 
 def format_card(meta: dict) -> str:
+    """
+    Форматирует карточку для удобного чтения и копирования.
+    Без ссылки — она уже есть в оригинальном сообщении.
+    """
+    if not meta:
+        return ""
+
     lines = []
+
     if meta.get("site_name"):
         lines.append(f"🌐 {meta['site_name']}")
+
     if meta.get("title"):
         lines.append(f"📌 {meta['title']}")
+
     if meta.get("brand"):
-        lines.append(f"🏷 {meta['brand']}")
+        lines.append(f"🏷 Бренд: {meta['brand']}")
+
     if meta.get("price"):
-        lines.append(f"💰 {meta['price']}")
+        lines.append(f"💰 Ціна: {meta['price']}")
+
     if meta.get("rating"):
-        lines.append(meta["rating"])
+        lines.append(f"{meta['rating']}")
+
     if meta.get("description"):
-        desc = meta["description"]
-        if len(desc) > 200:
-            desc = desc[:200].rsplit(" ", 1)[0] + "…"
-        lines.append(f"\n{desc}")
+        desc = meta["description"].strip()
+        # Полное описание до 300 символов для удобного копирования
+        if len(desc) > 300:
+            desc = desc[:300].rsplit(" ", 1)[0] + "…"
+        lines.append(f"\n📝 {desc}")
+
     return "\n".join(lines)
