@@ -46,6 +46,8 @@ async def init():
             "--disable-translate",
             "--mute-audio",
             "--hide-scrollbars",
+            # Отключаем загрузку шрифтов — главная причина таймаутов
+            "--disable-remote-fonts",
         ]
     )
     log_ram("Browser started")
@@ -61,6 +63,13 @@ async def shoot(url: str) -> list[bytes]:
         try:
             page = await ctx.new_page()
             await stealth_async(page)
+
+            # Блокируем внешние шрифты на уровне сети
+            await page.route(
+                "**/{*.woff,*.woff2,*.ttf,*.otf,*.eot}",
+                lambda route: route.abort()
+            )
+
             await page.goto(
                 url,
                 wait_until="domcontentloaded",
@@ -69,25 +78,24 @@ async def shoot(url: str) -> list[bytes]:
             await page.wait_for_timeout(PAUSE_MS)
             await _close_cookies(page)
 
-            # Получаем полную страницу одним снимком — как Web-Screenshot-Bot
-            full_png = await page.screenshot(full_page=True)
+            # timeout=10_000 на сам скриншот
+            # animations="disabled" — не ждём анимаций и шрифтов
+            full_png = await page.screenshot(
+                full_page=True,
+                animations="disabled",
+                timeout=10_000
+            )
             log_ram("After screenshot")
 
-            # Нарезаем готовое изображение через Pillow — никаких координат браузера
             return _split_image(full_png, PARTS, MAX_PAGE_HEIGHT)
 
         finally:
             await ctx.close()
 
 def _split_image(png_bytes: bytes, parts: int, max_height: int) -> list[bytes]:
-    """
-    Нарезает PNG на равные части по высоте.
-    Работает с готовым изображением — никаких проблем с координатами.
-    """
     img = Image.open(BytesIO(png_bytes))
     width, height = img.size
 
-    # Ограничение высоты
     if height > max_height:
         img = img.crop((0, 0, width, max_height))
         height = max_height
@@ -98,11 +106,8 @@ def _split_image(png_bytes: bytes, parts: int, max_height: int) -> list[bytes]:
     for i in range(parts):
         top = i * part_height
         bottom = top + part_height if i < parts - 1 else height
-
-        # Пропускаем пустые части
         if top >= height:
             break
-
         part = img.crop((0, top, width, bottom))
         buf = BytesIO()
         part.save(buf, format="PNG")
