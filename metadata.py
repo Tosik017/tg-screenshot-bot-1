@@ -3,17 +3,14 @@ from selectolax.parser import HTMLParser
 from loguru import logger
 
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
     "Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)",
     "Twitterbot/1.0",
     "facebookexternalhit/1.1",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 ]
 
 async def fetch(url: str) -> dict:
-    # Пробуем разные User-Agent по очереди
-    # Slackbot и Twitterbot часто получают чистые метаданные даже с Cloudflare
     for ua in USER_AGENTS:
         try:
             headers = {
@@ -21,27 +18,18 @@ async def fetch(url: str) -> dict:
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "uk,ru;q=0.9,en;q=0.8",
             }
-            # Добавляем Range только для обычных UA чтобы не получить частичный ответ
-            if "bot" not in ua.lower() and "slack" not in ua.lower():
-                headers["Range"] = "bytes=0-65536"
-
             async with httpx.AsyncClient(
                 follow_redirects=True,
                 timeout=8
             ) as client:
                 r = await client.get(url, headers=headers)
-
             result = _parse(r.text, url)
-
-            # Если получили хоть заголовок — возвращаем
             if result.get("title"):
                 logger.info(f"Metadata OK ua={ua[:30]} url={url}")
                 return result
-
         except Exception as e:
             logger.warning(f"Metadata attempt failed ua={ua[:30]}: {e}")
             continue
-
     logger.warning(f"All metadata attempts failed for {url}")
     return {}
 
@@ -71,7 +59,6 @@ def _parse(html: str, url: str) -> dict:
         if node:
             result["title"] = node.text(strip=True)
 
-    # JSON-LD для товаров
     for node in tree.css('script[type="application/ld+json"]'):
         try:
             data = json.loads(node.text())
@@ -103,7 +90,8 @@ def _parse(html: str, url: str) -> dict:
 
     return result
 
-def format_card(meta: dict, url: str) -> str:
+def format_card(meta: dict) -> str:
+    """Карточка БЕЗ ссылки — ссылка уже есть в оригинальном сообщении."""
     lines = []
     if meta.get("site_name"):
         lines.append(f"🌐 {meta['site_name']}")
@@ -120,5 +108,4 @@ def format_card(meta: dict, url: str) -> str:
         if len(desc) > 200:
             desc = desc[:200].rsplit(" ", 1)[0] + "…"
         lines.append(f"\n{desc}")
-    lines.append(f"\n🔗 {url}")
-    return "\n".join(lines) if lines else url
+    return "\n".join(lines)
