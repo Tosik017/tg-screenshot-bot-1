@@ -28,8 +28,7 @@ def build_message(meta: dict) -> tuple[str, list[MessageEntity]]:
 
     if meta.get("title"):
         title = meta["title"]
-        prefix = "📌 "
-        text += prefix
+        text += "📌 "
         start = len(text.encode("utf-16-le")) // 2
         text += title + "\n"
         end = len(text.encode("utf-16-le")) // 2 - 1
@@ -69,14 +68,27 @@ def build_disclaimer_only() -> tuple[str, list[MessageEntity]]:
     entities = [MessageEntity(type="blockquote", offset=start, length=end - start)]
     return text, entities
 
-def trim_caption(text: str, entities: list[MessageEntity]) -> tuple[str, list[MessageEntity]]:
-    """Обрезает caption до 1024 символов с учётом entities."""
+def trim_caption(text: str, entities: list) -> tuple[str, list]:
     if len(text) <= 1024:
         return text, entities
     text = text[:1021] + "…"
     limit = len(text.encode("utf-16-le")) // 2
     entities = [e for e in entities if e.offset + e.length <= limit]
     return text, entities
+
+def merge_meta(httpx_meta: dict, browser_meta: dict) -> dict:
+    """
+    Объединяем метаданные из httpx и браузера.
+    Браузер приоритетнее — он видит JS-рендер и реальный контент.
+    """
+    result = {**httpx_meta}
+    for key, value in browser_meta.items():
+        if value and (key not in result or not result[key]):
+            result[key] = value
+        # Для цены и рейтинга браузер всегда приоритетнее
+        if key in ("price", "rating", "brand") and value:
+            result[key] = value
+    return result
 
 @router.message()
 async def handle(msg: Message):
@@ -92,10 +104,8 @@ async def handle(msg: Message):
         await msg.reply("🚫 Посилання веде на недоступний ресурс.")
         return
 
-    # Кэш — берём file_id но метаданные всё равно подгружаем
     cached_file_id = cache.get(url)
     if cached_file_id:
-        # Быстро берём только метаданные (без скриншота)
         meta = await metadata.fetch(url)
         if meta and meta.get("title"):
             msg_text, msg_entities = build_message(meta)
@@ -109,14 +119,18 @@ async def handle(msg: Message):
         )
         return
 
-    # Моментальное предупреждение
     status = await msg.reply(WARNING_INSTANT)
     start = time.monotonic()
 
-    # Параллельно: метаданные + скриншот
-    meta_task = asyncio.create_task(metadata.fetch(url))
+    # httpx и браузер параллельно
+    httpx_task = asyncio.create_task(metadata.fetch(url))
     shot_task = asyncio.create_task(screenshot.shoot(url))
-    meta, shot = await asyncio.gather(meta_task, shot_task)
+
+    httpx_meta, (shot, browser_meta) = await asyncio.gather(httpx_task, shot_task)
+
+    # Объединяем — браузер приоритетнее
+    meta = merge_meta(httpx_meta, browser_meta)
+    logger.info(f"Final meta: title={meta.get('title')} price={meta.get('price')} brand={meta.get('brand')}")
 
     elapsed = time.monotonic() - start
 

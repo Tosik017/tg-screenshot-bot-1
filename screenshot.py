@@ -3,6 +3,7 @@ from playwright.async_api import async_playwright
 from playwright_stealth import stealth_async
 from loguru import logger
 from config import USER_AGENT, TIMEOUT_MS, PAUSE_MS, SEMAPHORE
+from metadata import parse_from_html
 
 semaphore = asyncio.Semaphore(SEMAPHORE)
 _browser = None
@@ -48,8 +49,13 @@ async def init():
     )
     log_ram("Browser started")
 
-async def shoot(url: str) -> bytes | None:
-    """Один скриншот. Возвращает bytes или None если не получилось."""
+async def shoot(url: str) -> tuple[bytes | None, dict]:
+    """
+    Возвращает (скриншот, метаданные).
+    Метаданные берём из page.content() — из того же браузера.
+    Это решает проблему с Elmir, Rozetka и другими сайтами
+    которые блокируют httpx но пускают реальный браузер.
+    """
     log_ram("Before screenshot")
     async with semaphore:
         ctx = await _browser.new_context(
@@ -74,6 +80,11 @@ async def shoot(url: str) -> bytes | None:
             await page.wait_for_timeout(PAUSE_MS)
             await _close_cookies(page)
 
+            # Берём HTML из браузера — сайт уже загружен и выполнил JS
+            html = await page.content()
+            browser_meta = parse_from_html(html, url)
+            logger.info(f"Browser metadata: title={browser_meta.get('title')} price={browser_meta.get('price')}")
+
             shot = await page.screenshot(
                 full_page=False,
                 clip={
@@ -86,11 +97,11 @@ async def shoot(url: str) -> bytes | None:
                 timeout=10_000
             )
             log_ram("After screenshot")
-            return shot
+            return shot, browser_meta
 
         except Exception as e:
             logger.warning(f"Screenshot failed: {e}")
-            return None
+            return None, {}
 
         finally:
             await ctx.close()
