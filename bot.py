@@ -20,45 +20,30 @@ DISCLAIMER = (
 )
 
 def build_message(meta: dict) -> tuple[str, list[MessageEntity]]:
-    """
-    Будує текст + entities вручну.
-    Code для назви — виділяє в рамку і дозволяє копіювати одним тапом.
-    BlockQuote для попередження.
-    """
     text = ""
     entities = []
 
     if meta.get("site_name"):
         text += f"🌐 {meta['site_name']}\n"
 
-    # Назва в CODE — рамка + копіювання одним тапом
     if meta.get("title"):
         title = meta["title"]
         prefix = "📌 "
         text += prefix
         start = len(text.encode("utf-16-le")) // 2
         text += title + "\n"
-        end = len(text.encode("utf-16-le")) // 2 - 1  # -1 за \n
-        entities.append(MessageEntity(
-            type="code",
-            offset=start,
-            length=end - start
-        ))
+        end = len(text.encode("utf-16-le")) // 2 - 1
+        entities.append(MessageEntity(type="code", offset=start, length=end - start))
 
     if meta.get("brand"):
         text += f"🏷 Бренд: {meta['brand']}\n"
 
-    # Ціна жирна
     if meta.get("price"):
         price_str = f"💰 Ціна: {meta['price']}"
         start = len(text.encode("utf-16-le")) // 2
         text += price_str + "\n"
         end = len(text.encode("utf-16-le")) // 2 - 1
-        entities.append(MessageEntity(
-            type="bold",
-            offset=start,
-            length=end - start
-        ))
+        entities.append(MessageEntity(type="bold", offset=start, length=end - start))
 
     if meta.get("rating"):
         text += f"{meta['rating']}\n"
@@ -69,18 +54,11 @@ def build_message(meta: dict) -> tuple[str, list[MessageEntity]]:
             desc = desc[:300].rsplit(" ", 1)[0] + "…"
         text += f"\n📝 {desc}\n"
 
-    # Відступ перед попередженням
     text += "\n"
-
-    # Попередження — blockquote
     start = len(text.encode("utf-16-le")) // 2
     text += DISCLAIMER
     end = len(text.encode("utf-16-le")) // 2
-    entities.append(MessageEntity(
-        type="blockquote",
-        offset=start,
-        length=end - start
-    ))
+    entities.append(MessageEntity(type="blockquote", offset=start, length=end - start))
 
     return text, entities
 
@@ -89,6 +67,15 @@ def build_disclaimer_only() -> tuple[str, list[MessageEntity]]:
     start = len("ℹ️ Не вдалось отримати дані про сторінку.\n\n".encode("utf-16-le")) // 2
     end = len(text.encode("utf-16-le")) // 2
     entities = [MessageEntity(type="blockquote", offset=start, length=end - start)]
+    return text, entities
+
+def trim_caption(text: str, entities: list[MessageEntity]) -> tuple[str, list[MessageEntity]]:
+    """Обрезает caption до 1024 символов с учётом entities."""
+    if len(text) <= 1024:
+        return text, entities
+    text = text[:1021] + "…"
+    limit = len(text.encode("utf-16-le")) // 2
+    entities = [e for e in entities if e.offset + e.length <= limit]
     return text, entities
 
 @router.message()
@@ -105,14 +92,28 @@ async def handle(msg: Message):
         await msg.reply("🚫 Посилання веде на недоступний ресурс.")
         return
 
-    cached = cache.get(url)
-    if cached:
-        await msg.reply_photo(cached)
+    # Кэш — берём file_id но метаданные всё равно подгружаем
+    cached_file_id = cache.get(url)
+    if cached_file_id:
+        # Быстро берём только метаданные (без скриншота)
+        meta = await metadata.fetch(url)
+        if meta and meta.get("title"):
+            msg_text, msg_entities = build_message(meta)
+        else:
+            msg_text, msg_entities = build_disclaimer_only()
+        cap_text, cap_entities = trim_caption(msg_text, msg_entities)
+        await msg.reply_photo(
+            photo=cached_file_id,
+            caption=cap_text,
+            caption_entities=cap_entities,
+        )
         return
 
+    # Моментальное предупреждение
     status = await msg.reply(WARNING_INSTANT)
     start = time.monotonic()
 
+    # Параллельно: метаданные + скриншот
     meta_task = asyncio.create_task(metadata.fetch(url))
     shot_task = asyncio.create_task(screenshot.shoot(url))
     meta, shot = await asyncio.gather(meta_task, shot_task)
@@ -126,16 +127,7 @@ async def handle(msg: Message):
 
     try:
         if shot:
-            # Caption limit = 1024
-            cap_text = msg_text
-            cap_entities = msg_entities
-            if len(cap_text) > 1024:
-                cap_text = cap_text[:1021] + "…"
-                cap_entities = [
-                    e for e in cap_entities
-                    if e.offset + e.length <= len(cap_text.encode("utf-16-le")) // 2
-                ]
-
+            cap_text, cap_entities = trim_caption(msg_text, msg_entities)
             sent = await msg.reply_photo(
                 photo=BufferedInputFile(shot, filename="preview.png"),
                 caption=cap_text,
@@ -145,10 +137,7 @@ async def handle(msg: Message):
                 cache.save(url, sent.photo[-1].file_id)
             logger.info(f"OK+photo url={url} time={elapsed:.1f}s")
         else:
-            await msg.reply(
-                text=msg_text,
-                entities=msg_entities,
-            )
+            await msg.reply(text=msg_text, entities=msg_entities)
             logger.info(f"OK+text url={url} time={elapsed:.1f}s")
 
     except Exception as e:
