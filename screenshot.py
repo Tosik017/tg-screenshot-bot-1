@@ -67,30 +67,60 @@ async def shoot(url: str) -> list[bytes]:
             )
             await page.wait_for_timeout(PAUSE_MS)
             await _close_cookies(page)
+
+            # Получаем реальную высоту страницы
             page_height = await page.evaluate(
                 "document.documentElement.scrollHeight"
             )
             page_height = min(page_height, MAX_PAGE_HEIGHT)
+
+            # Защита: страница должна быть хотя бы 100px
+            if page_height < 100:
+                page_height = MOBILE_HEIGHT
+
             part_height = math.ceil(page_height / PARTS)
+
             screenshots = []
             for i in range(PARTS):
                 y = i * part_height
+
+                # Не выходим за границы
                 if y >= page_height:
                     break
+
+                # Высота этой части — не больше чем осталось
+                h = min(part_height, page_height - y)
+
+                # Защита: пропускаем если высота меньше 10px
+                if h < 10:
+                    break
+
                 await page.evaluate(f"window.scrollTo(0, {y})")
                 await page.wait_for_timeout(300)
-                shot = await page.screenshot(
-                    full_page=False,
-                    clip={
-                        "x": 0,
-                        "y": y,
-                        "width": MOBILE_WIDTH,
-                        "height": min(part_height, page_height - y)
-                    }
-                )
+
+                try:
+                    shot = await page.screenshot(
+                        full_page=False,
+                        clip={
+                            "x": 0,
+                            "y": y,
+                            "width": MOBILE_WIDTH,
+                            "height": h
+                        }
+                    )
+                    screenshots.append(shot)
+                except Exception as e:
+                    logger.warning(f"Part {i+1} skipped: {e}")
+                    continue
+
+            # Если ни одного скриншота не получили — делаем один общий
+            if not screenshots:
+                shot = await page.screenshot(full_page=False)
                 screenshots.append(shot)
+
             log_ram("After screenshot")
             return screenshots
+
         finally:
             await ctx.close()
 

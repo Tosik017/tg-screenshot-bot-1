@@ -8,10 +8,12 @@ from config import BOT_TOKEN, PORT
 app = FastAPI()
 
 @app.get("/")
+@app.head("/")
 async def root():
     return {"ok": True}
 
 @app.get("/ping")
+@app.head("/ping")
 async def ping():
     return {"ok": True}
 
