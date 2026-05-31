@@ -1,6 +1,4 @@
-import asyncio, os, psutil, math
-from PIL import Image
-from io import BytesIO
+import asyncio, os, psutil
 from playwright.async_api import async_playwright
 from playwright_stealth import stealth_async
 from loguru import logger
@@ -11,8 +9,6 @@ _browser = None
 
 MOBILE_WIDTH = 390
 MOBILE_HEIGHT = 844
-PARTS = 4
-MAX_PAGE_HEIGHT = 12000
 
 COOKIE_SELECTORS = [
     "button[id*='accept']",
@@ -52,8 +48,9 @@ async def init():
     )
     log_ram("Browser started")
 
-async def shoot(url: str) -> list[bytes]:
-    log_ram("Before request")
+async def shoot(url: str) -> bytes | None:
+    """Один скриншот. Возвращает bytes или None если не получилось."""
+    log_ram("Before screenshot")
     async with semaphore:
         ctx = await _browser.new_context(
             viewport={"width": MOBILE_WIDTH, "height": MOBILE_HEIGHT},
@@ -64,7 +61,6 @@ async def shoot(url: str) -> list[bytes]:
             page = await ctx.new_page()
             await stealth_async(page)
 
-            # Блокируем внешние шрифты — главная причина зависаний
             await page.route(
                 "**/*.{woff,woff2,ttf,otf,eot}",
                 lambda route: route.abort()
@@ -78,56 +74,23 @@ async def shoot(url: str) -> list[bytes]:
             await page.wait_for_timeout(PAUSE_MS)
             await _close_cookies(page)
 
-            # Узнаём реальную высоту страницы
-            page_height = await page.evaluate(
-                "document.documentElement.scrollHeight"
+            shot = await page.screenshot(
+                full_page=False,
+                clip={
+                    "x": 0,
+                    "y": 0,
+                    "width": MOBILE_WIDTH,
+                    "height": MOBILE_HEIGHT
+                },
+                animations="disabled",
+                timeout=10_000
             )
-            page_height = min(page_height, MAX_PAGE_HEIGHT)
-            part_height = math.ceil(page_height / PARTS)
-
-            screenshots = []
-            for i in range(PARTS):
-                y = i * part_height
-                if y >= page_height:
-                    break
-
-                h = min(part_height, page_height - y)
-                if h < 10:
-                    break
-
-                # Скроллим к нужной части
-                await page.evaluate(f"window.scrollTo(0, {y})")
-                await page.wait_for_timeout(200)
-
-                try:
-                    # Снимаем только видимую область — быстро и без зависаний
-                    shot = await page.screenshot(
-                        full_page=False,
-                        clip={
-                            "x": 0,
-                            "y": y,
-                            "width": MOBILE_WIDTH,
-                            "height": h
-                        },
-                        animations="disabled",
-                        timeout=8_000
-                    )
-                    screenshots.append(shot)
-                except Exception as e:
-                    logger.warning(f"Part {i+1} skip: {e}")
-                    continue
-
-            if not screenshots:
-                # Последний резерв — снимок только видимой части без скролла
-                shot = await page.screenshot(
-                    full_page=False,
-                    animations="disabled",
-                    timeout=8_000
-                )
-                screenshots.append(shot)
-
             log_ram("After screenshot")
-            return screenshots
+            return shot
+
+        except Exception as e:
+            logger.warning(f"Screenshot failed: {e}")
+            return None
 
         finally:
             await ctx.close()

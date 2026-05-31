@@ -6,4 +6,6 @@ uvicorn==0.30.0
 cachetools==5.3.3
 loguru==0.7.2
 psutil==5.9.8
-Pillow==10.3.0
+httpx==0.27.0
+selectolax==0.3.21
+extruct==0.17.0
