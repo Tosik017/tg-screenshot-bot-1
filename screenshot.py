@@ -162,7 +162,7 @@ async def shoot(url: str) -> tuple[list[bytes], dict]:
             full_png = await page.screenshot(
                 full_page=True,
                 animations="disabled",
-                timeout=15_000
+                timeout=20_000
             )
             log_ram("After screenshot")
 
