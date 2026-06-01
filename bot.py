@@ -4,7 +4,7 @@ from aiogram import Router, BaseMiddleware
 from aiogram.types import Message, BufferedInputFile, MessageEntity, InputMediaPhoto, TelegramObject
 from typing import Any, Callable, Awaitable
 from loguru import logger
-import cache, security, screenshot, metadata, blacklist, domain_age
+import cache, security, screenshot, metadata
 
 router = Router()
 URL_RE = re.compile(r'https?://[^\s]+')
@@ -12,9 +12,9 @@ URL_RE = re.compile(r'https?://[^\s]+')
 MAX_MSG_AGE = 60
 
 # --- Rate limiting ---
-# Один запрос на 5 сек с user_id. Уведомляем пользователя — чтобы знал почему бот молчит.
+# Один запрос на 15 сек с user_id. Тихий дроп — без ответа, чтобы не спамить в чат.
 RATE_LIMIT_SEC = 5
-_rate_store: dict[int, float] = {}
+_rate_store: dict[int, float] = {}  # user_id → timestamp последнего запроса
 
 class RateLimitMiddleware(BaseMiddleware):
     async def __call__(
@@ -33,10 +33,8 @@ class RateLimitMiddleware(BaseMiddleware):
         now = time.monotonic()
         last = _rate_store.get(user_id, 0)
         if now - last < RATE_LIMIT_SEC:
-            remaining = int(RATE_LIMIT_SEC - (now - last)) + 1
             logger.info(f"RATE_LIMIT user={user_id} cooldown={RATE_LIMIT_SEC - (now - last):.1f}s")
-            await event.reply(f"⏳ Зачекайте {remaining} сек. перед наступним запитом.")
-            return
+            return  # Тихий дроп
         _rate_store[user_id] = now
         return await handler(event, data)
 
@@ -57,7 +55,7 @@ DISCLAIMER = (
     "🔎 Безпечніше знайти цей товар через пошук Google."
 )
 
-def build_message(meta: dict, age_warning: str | None = None) -> tuple[str, list[MessageEntity]]:
+def build_message(meta: dict) -> tuple[str, list[MessageEntity]]:
     text = ""
     entities = []
 
@@ -91,9 +89,6 @@ def build_message(meta: dict, age_warning: str | None = None) -> tuple[str, list
             desc = desc[:300].rsplit(" ", 1)[0] + "…"
         text += f"\n📝 {desc}\n"
 
-    if age_warning:
-        text += f"\n{age_warning}\n"
-
     text += "\n"
     start = len(text.encode("utf-16-le")) // 2
     text += DISCLAIMER
@@ -102,10 +97,9 @@ def build_message(meta: dict, age_warning: str | None = None) -> tuple[str, list
 
     return text, entities
 
-def build_disclaimer_only(age_warning: str | None = None) -> tuple[str, list[MessageEntity]]:
-    warning_line = f"{age_warning}\n\n" if age_warning else ""
-    text = f"ℹ️ Не вдалось отримати дані про сторінку.\n\n{warning_line}" + DISCLAIMER
-    start = len(f"ℹ️ Не вдалось отримати дані про сторінку.\n\n{warning_line}".encode("utf-16-le")) // 2
+def build_disclaimer_only() -> tuple[str, list[MessageEntity]]:
+    text = "ℹ️ Не вдалось отримати дані про сторінку.\n\n" + DISCLAIMER
+    start = len("ℹ️ Не вдалось отримати дані про сторінку.\n\n".encode("utf-16-le")) // 2
     end = len(text.encode("utf-16-le")) // 2
     entities = [MessageEntity(type="blockquote", offset=start, length=end - start)]
     return text, entities
@@ -151,15 +145,6 @@ async def handle(msg: Message):
         await msg.reply("🚫 Посилання веде на недоступний ресурс.")
         return
 
-    blocked, reason = blacklist.is_blacklisted(url)
-    if blocked:
-        logger.info(f"BLACKLIST block url={url} reason={reason}")
-        await msg.reply(
-            "🚫 Це посилання заблоковано як фішингове.\n"
-            "⚠️ Не переходьте за ним і не вводьте жодних даних."
-        )
-        return
-
     cached_file_id = cache.get(url)
     if cached_file_id:
         meta = await metadata.fetch(url)
@@ -180,17 +165,8 @@ async def handle(msg: Message):
 
     httpx_task = asyncio.create_task(metadata.fetch(url))
     shot_task = asyncio.create_task(screenshot.shoot(url))
-    ssrf_task = asyncio.create_task(security.is_safe_after_redirects(url))
-    whois_task = asyncio.create_task(domain_age.get_domain_age_warning(url))
 
-    httpx_meta, (parts, browser_meta), redirect_safe, age_warning = await asyncio.gather(
-        httpx_task, shot_task, ssrf_task, whois_task
-    )
-
-    if not redirect_safe:
-        logger.warning(f"SSRF blocked after redirects: {url}")
-        await status.edit_text("🚫 Посилання веде на недоступний ресурс (редирект).")
-        return
+    httpx_meta, (parts, browser_meta) = await asyncio.gather(httpx_task, shot_task)
 
     meta = merge_meta(httpx_meta, browser_meta)
     logger.info(f"Final meta: title={meta.get('title')} price={meta.get('price')}")
@@ -198,9 +174,9 @@ async def handle(msg: Message):
     elapsed = time.monotonic() - start
 
     if meta and meta.get("title"):
-        msg_text, msg_entities = build_message(meta, age_warning)
+        msg_text, msg_entities = build_message(meta)
     else:
-        msg_text, msg_entities = build_disclaimer_only(age_warning)
+        msg_text, msg_entities = build_disclaimer_only()
 
     try:
         if parts:
