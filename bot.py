@@ -12,9 +12,9 @@ URL_RE = re.compile(r'https?://[^\s]+')
 MAX_MSG_AGE = 60
 
 # --- Rate limiting ---
-# Один запрос на 15 сек с user_id. Тихий дроп — без ответа, чтобы не спамить в чат.
+# Один запрос на 5 сек с user_id. Тихий дроп — без ответа, чтобы не спамить в чат.
 RATE_LIMIT_SEC = 5
-_rate_store: dict[int, float] = {}  # user_id → timestamp последнего запроса
+_rate_store: dict[int, float] = {}
 
 class RateLimitMiddleware(BaseMiddleware):
     async def __call__(
@@ -34,7 +34,7 @@ class RateLimitMiddleware(BaseMiddleware):
         last = _rate_store.get(user_id, 0)
         if now - last < RATE_LIMIT_SEC:
             logger.info(f"RATE_LIMIT user={user_id} cooldown={RATE_LIMIT_SEC - (now - last):.1f}s")
-            return  # Тихий дроп
+            return
         _rate_store[user_id] = now
         return await handler(event, data)
 
@@ -141,6 +141,7 @@ async def handle(msg: Message):
     url = urls[0]
     screenshot.log_ram("Start request")
 
+    # Быстрая синхронная проверка — до WARNING_INSTANT
     if not security.is_safe(url):
         await msg.reply("🚫 Посилання веде на недоступний ресурс.")
         return
@@ -163,10 +164,20 @@ async def handle(msg: Message):
     status = await msg.reply(WARNING_INSTANT)
     start = time.monotonic()
 
+    # Три задачи параллельно: метаданные + скриншот + проверка редиректов
     httpx_task = asyncio.create_task(metadata.fetch(url))
     shot_task = asyncio.create_task(screenshot.shoot(url))
+    ssrf_task = asyncio.create_task(security.is_safe_after_redirects(url))
 
-    httpx_meta, (parts, browser_meta) = await asyncio.gather(httpx_task, shot_task)
+    httpx_meta, (parts, browser_meta), redirect_safe = await asyncio.gather(
+        httpx_task, shot_task, ssrf_task
+    )
+
+    # Если редирект привёл на приватный IP — блокируем постфактум
+    if not redirect_safe:
+        logger.warning(f"SSRF blocked after redirects: {url}")
+        await status.edit_text("🚫 Посилання веде на недоступний ресурс (редирект).")
+        return
 
     meta = merge_meta(httpx_meta, browser_meta)
     logger.info(f"Final meta: title={meta.get('title')} price={meta.get('price')}")
