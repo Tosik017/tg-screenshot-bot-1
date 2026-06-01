@@ -12,7 +12,7 @@ URL_RE = re.compile(r'https?://[^\s]+')
 MAX_MSG_AGE = 60
 
 # --- Rate limiting ---
-# Один запрос на 5 сек с user_id. Тихий дроп — без ответа, чтобы не спамить в чат.
+# Один запрос на 5 сек с user_id. Уведомляем пользователя — чтобы знал почему бот молчит.
 RATE_LIMIT_SEC = 5
 _rate_store: dict[int, float] = {}
 
@@ -33,7 +33,9 @@ class RateLimitMiddleware(BaseMiddleware):
         now = time.monotonic()
         last = _rate_store.get(user_id, 0)
         if now - last < RATE_LIMIT_SEC:
+            remaining = int(RATE_LIMIT_SEC - (now - last)) + 1
             logger.info(f"RATE_LIMIT user={user_id} cooldown={RATE_LIMIT_SEC - (now - last):.1f}s")
+            await event.reply(f"⏳ Зачекайте {remaining} сек. перед наступним запитом.")
             return
         _rate_store[user_id] = now
         return await handler(event, data)
@@ -89,7 +91,6 @@ def build_message(meta: dict, age_warning: str | None = None) -> tuple[str, list
             desc = desc[:300].rsplit(" ", 1)[0] + "…"
         text += f"\n📝 {desc}\n"
 
-    # Предупреждение о молодом домене — перед DISCLAIMER, отдельной строкой
     if age_warning:
         text += f"\n{age_warning}\n"
 
@@ -146,12 +147,10 @@ async def handle(msg: Message):
     url = urls[0]
     screenshot.log_ram("Start request")
 
-    # Быстрая синхронная проверка SSRF — до WARNING_INSTANT
     if not security.is_safe(url):
         await msg.reply("🚫 Посилання веде на недоступний ресурс.")
         return
 
-    # Проверка blacklist — до WARNING_INSTANT, мгновенно, без Playwright
     blocked, reason = blacklist.is_blacklisted(url)
     if blocked:
         logger.info(f"BLACKLIST block url={url} reason={reason}")
@@ -179,7 +178,6 @@ async def handle(msg: Message):
     status = await msg.reply(WARNING_INSTANT)
     start = time.monotonic()
 
-    # Четыре задачи параллельно: метаданные + скриншот + SSRF-редиректы + WHOIS
     httpx_task = asyncio.create_task(metadata.fetch(url))
     shot_task = asyncio.create_task(screenshot.shoot(url))
     ssrf_task = asyncio.create_task(security.is_safe_after_redirects(url))
