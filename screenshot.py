@@ -14,7 +14,7 @@ MOBILE_WIDTH = 390
 MOBILE_HEIGHT = 844
 
 # Максимальная высота до обрезки — защита от OOM на Render Free
-MAX_HEIGHT = 8000
+MAX_HEIGHT = 4000  # ~3 частини для типової товарної сторінки
 
 # Максимальная высота одной части для отправки в Telegram
 PART_HEIGHT = 1280
