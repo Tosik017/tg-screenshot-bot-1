@@ -419,11 +419,5 @@ MIT License — см. [LICENSE](LICENSE).
 
 ---
 
-## 📞 Поддержка
-
-- **Issues**: [GitHub Issues](https://github.com/Tosik017/tg-screenshot-bot-1/issues)
-- **Author**: [@Tosik017](https://t.me/Tosik017)
-
----
 
 **Сделано с ❤️ для безопасного веб-сёрфинга**
