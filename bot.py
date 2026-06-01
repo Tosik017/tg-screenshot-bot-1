@@ -4,7 +4,7 @@ from aiogram import Router, BaseMiddleware
 from aiogram.types import Message, BufferedInputFile, MessageEntity, InputMediaPhoto, TelegramObject
 from typing import Any, Callable, Awaitable
 from loguru import logger
-import cache, security, screenshot, metadata, blacklist
+import cache, security, screenshot, metadata, blacklist, domain_age
 
 router = Router()
 URL_RE = re.compile(r'https?://[^\s]+')
@@ -55,7 +55,7 @@ DISCLAIMER = (
     "🔎 Безпечніше знайти цей товар через пошук Google."
 )
 
-def build_message(meta: dict) -> tuple[str, list[MessageEntity]]:
+def build_message(meta: dict, age_warning: str | None = None) -> tuple[str, list[MessageEntity]]:
     text = ""
     entities = []
 
@@ -89,6 +89,10 @@ def build_message(meta: dict) -> tuple[str, list[MessageEntity]]:
             desc = desc[:300].rsplit(" ", 1)[0] + "…"
         text += f"\n📝 {desc}\n"
 
+    # Предупреждение о молодом домене — перед DISCLAIMER, отдельной строкой
+    if age_warning:
+        text += f"\n{age_warning}\n"
+
     text += "\n"
     start = len(text.encode("utf-16-le")) // 2
     text += DISCLAIMER
@@ -97,9 +101,10 @@ def build_message(meta: dict) -> tuple[str, list[MessageEntity]]:
 
     return text, entities
 
-def build_disclaimer_only() -> tuple[str, list[MessageEntity]]:
-    text = "ℹ️ Не вдалось отримати дані про сторінку.\n\n" + DISCLAIMER
-    start = len("ℹ️ Не вдалось отримати дані про сторінку.\n\n".encode("utf-16-le")) // 2
+def build_disclaimer_only(age_warning: str | None = None) -> tuple[str, list[MessageEntity]]:
+    warning_line = f"{age_warning}\n\n" if age_warning else ""
+    text = f"ℹ️ Не вдалось отримати дані про сторінку.\n\n{warning_line}" + DISCLAIMER
+    start = len(f"ℹ️ Не вдалось отримати дані про сторінку.\n\n{warning_line}".encode("utf-16-le")) // 2
     end = len(text.encode("utf-16-le")) // 2
     entities = [MessageEntity(type="blockquote", offset=start, length=end - start)]
     return text, entities
@@ -174,13 +179,14 @@ async def handle(msg: Message):
     status = await msg.reply(WARNING_INSTANT)
     start = time.monotonic()
 
-    # Три задачи параллельно: метаданные + скриншот + проверка редиректов
+    # Четыре задачи параллельно: метаданные + скриншот + SSRF-редиректы + WHOIS
     httpx_task = asyncio.create_task(metadata.fetch(url))
     shot_task = asyncio.create_task(screenshot.shoot(url))
     ssrf_task = asyncio.create_task(security.is_safe_after_redirects(url))
+    whois_task = asyncio.create_task(domain_age.get_domain_age_warning(url))
 
-    httpx_meta, (parts, browser_meta), redirect_safe = await asyncio.gather(
-        httpx_task, shot_task, ssrf_task
+    httpx_meta, (parts, browser_meta), redirect_safe, age_warning = await asyncio.gather(
+        httpx_task, shot_task, ssrf_task, whois_task
     )
 
     if not redirect_safe:
@@ -194,9 +200,9 @@ async def handle(msg: Message):
     elapsed = time.monotonic() - start
 
     if meta and meta.get("title"):
-        msg_text, msg_entities = build_message(meta)
+        msg_text, msg_entities = build_message(meta, age_warning)
     else:
-        msg_text, msg_entities = build_disclaimer_only()
+        msg_text, msg_entities = build_disclaimer_only(age_warning)
 
     try:
         if parts:
