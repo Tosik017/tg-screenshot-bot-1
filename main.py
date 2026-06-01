@@ -1,4 +1,4 @@
-import asyncio, os, uvicorn
+import asyncio, signal, uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from aiogram import Bot, Dispatcher
@@ -47,12 +47,55 @@ async def health():
         }
     )
 
+async def shutdown(dp: Dispatcher, server: uvicorn.Server):
+    """
+    Graceful shutdown при SIGTERM (Render останавливает контейнер при деплое).
+    Порядок важен:
+    1. Останавливаем polling — новые сообщения не принимаем
+    2. Ждём семафор — текущий скриншот должен завершиться
+    3. Закрываем браузер чисто — без zombie Chromium
+    4. Останавливаем HTTP-сервер
+    """
+    from loguru import logger
+    logger.info("SIGTERM received — starting graceful shutdown")
+
+    # 1. Останавливаем aiogram polling
+    await dp.stop_polling()
+    logger.info("Polling stopped")
+
+    # 2. Ждём освобождения семафора — текущий скриншот завершается
+    # Таймаут 60 сек — максимальное время одного скриншота
+    try:
+        await asyncio.wait_for(screenshot.semaphore.acquire(), timeout=60)
+        screenshot.semaphore.release()
+        logger.info("Semaphore free — no active screenshot")
+    except asyncio.TimeoutError:
+        logger.warning("Semaphore timeout — forcing shutdown anyway")
+
+    # 3. Закрываем браузер
+    if screenshot._browser is not None:
+        try:
+            await screenshot._browser.close()
+            logger.info("Browser closed cleanly")
+        except Exception as e:
+            logger.warning(f"Browser close error: {e}")
+
+    if screenshot._pw is not None:
+        try:
+            await screenshot._pw.stop()
+            logger.info("Playwright stopped")
+        except Exception as e:
+            logger.warning(f"Playwright stop error: {e}")
+
+    # 4. Останавливаем uvicorn
+    server.should_exit = True
+    logger.info("Shutdown complete")
+
 async def main():
     global _bot
 
     await screenshot.init()
 
-    # Загружаем фиды до старта polling — бот не обрабатывает запросы без blacklist
     await blacklist.update()
     blacklist.start_background_updater()
 
@@ -65,6 +108,14 @@ async def main():
     server = uvicorn.Server(
         uvicorn.Config(app, host="0.0.0.0", port=PORT)
     )
+
+    # Регистрируем SIGTERM handler — Render шлёт его при остановке контейнера
+    loop = asyncio.get_event_loop()
+    loop.add_signal_handler(
+        signal.SIGTERM,
+        lambda: asyncio.create_task(shutdown(dp, server))
+    )
+
     await asyncio.gather(
         dp.start_polling(_bot),
         server.serve()
