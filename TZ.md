@@ -1,263 +1,261 @@
-# Техническое задание
-## Telegram-бот: безопасный предпросмотр ссылок
-
-**Версия 4.1** · Рабочая · Деплой на Render Free
-
----
-
-## Назначение
-
-Контекст для нового чата с Claude или передачи другому разработчику. Описывает что делает бот, как устроен, и **почему приняты именно такие решения** — чтобы не повторять путь проб и ошибок.
+# Технічне завдання: tg-screenshot-bot — v5.0
+> Актуальний стан: **реалізовано і задеплоєно на Render Free**.  
+> Цей документ — єдине джерело правди про архітектуру, рішення та черги завдань.
 
 ---
 
-## 1. Что делает бот
+## 1. Суть проекту
 
-Пользователь присылает в чат ссылку. Бот:
+Telegram-бот для **безпечного попереднього перегляду посилань** у чатах і групах.
 
-1. **Моментально** отвечает ярким предупреждением «Не переходите по ссылке» — до того как человек успеет кликнуть.
-2. Параллельно делает скриншот страницы (мобильный вид) и вытягивает метаданные (название, цена, описание, бренд).
-3. Отправляет скриншот + текстовую карточку с данными + предупреждение-цитату.
-4. Если сайт за Cloudflare и скриншот не получился — отправляет только текстовую карточку с предупреждением.
+Сценарій: учасник чату отримує підозріле посилання → надсилає боту → бот відповідає **миттєвим попередженням** + через 30–120 сек — **скриншотом сторінки** + **текстовою карткою** з метаданими. Людина бачить, що на сайті, не переходячи туди.
 
-Главная ценность для пользователя — **не переходить по подозрительной ссылке**, а увидеть что там, безопасно.
+Цільова аудиторія: україномовні Telegram-групи, де активна фішинг-загроза.
 
 ---
 
-## 2. Технологический стек
+## 2. Поточний стек
 
-| Компонент | Версия | Зачем именно он |
-|---|---|---|
-| Python | 3.12 | Базовый язык |
-| aiogram | 3.7.0 | Telegram Bot API. Async-first — меньше RAM чем python-telegram-bot. **Важно:** туториалы под 2.x не подходят, API переписан |
-| Playwright + Chromium | 1.44.0 | Скриншоты. Лучше Selenium по RAM и стабильности |
-| playwright-stealth | 1.0.6 | Скрывает признаки headless-браузера от Cloudflare |
-| FastAPI + uvicorn | 0.111.0 + 0.30.0 | HTTP-сервер для `/ping`. **Обязателен** — Render Free требует открытый порт, иначе деплой падает с `Port scan timeout` |
-| httpx | 0.27.0 | Асинхронный HTTP для метаданных без браузера |
-| selectolax | 0.3.21 | C-парсер HTML. В 30× быстрее BeautifulSoup, меньше RAM |
-| cachetools | 5.3.3 | In-memory LRU кэш |
-| loguru | 0.7.2 | Логи |
-| psutil | 5.9.8 | Мониторинг RAM |
-| Pillow | 10.3.0 | Нарезка скриншота на части |
-| dumb-init | (в Docker) | **Критично:** Playwright 1.50+ оставляет zombie-процессы headless_shell после browser.close(). Без dumb-init они копятся и съедают RAM |
+| Компонент | Версія | Роль |
+|-----------|--------|------|
+| Python | 3.12 | Мова |
+| aiogram | 3.7.0 | Telegram Bot API, async |
+| Playwright | 1.44.0 | Headless Chromium, скриншоти |
+| playwright-stealth | 1.0.6 | Обхід Cloudflare detection |
+| FastAPI | 0.111.0 | HTTP-сервер для health check |
+| uvicorn | 0.30.0 | ASGI сервер |
+| httpx | 0.27.0 | Async HTTP для метаданих (без браузера) |
+| selectolax | 0.3.21 | C-парсер HTML, ~30× швидше BS4 |
+| cachetools | 5.3.3 | In-memory TTLCache для file_id |
+| loguru | 0.7.2 | Структуроване логування |
+| Pillow | 10.3.0 | Нарізка скриншотів на частини |
+| psutil | 5.9.8 | Моніторинг RAM |
+
+**Деплой**: Render Free (Docker), 512 МБ RAM, 0.1 CPU. GitHub → auto-deploy.  
+**Рестарт**: Suspend/Resume у Settings або `git commit --allow-empty -m "restart" && git push`.
 
 ---
 
-## 3. Поток данных (полный)
+## 3. Архітектура (поточна, реалізована)
 
 ```
-Пользователь присылает URL в чат
-            │
-            ▼
-[security.py] Проверка SSRF
-    DNS resolve → проверка IP на приватные диапазоны
-    Заблокирован → "🚫 Ссылка ведёт на недоступный ресурс"
-            │ безопасно
-            ▼
-[cache.py] Проверка кэша по MD5(url)
-    Есть file_id → подгружаем метаданные через httpx →
-                   отправляем фото + карточку → КОНЕЦ
-            │ нет в кэше
-            ▼
-Моментально отправляем WARNING_INSTANT
-(пользователь видит предупреждение СРАЗУ)
-            │
-            ▼
-ПАРАЛЛЕЛЬНО (asyncio.gather):
-    ┌─────────────────────┬──────────────────────────┐
-    │ [metadata.fetch]    │ [screenshot.shoot]       │
-    │ httpx, Slackbot UA  │ Playwright full_page     │
-    │ OG + Twitter +      │ + page.content() →       │
-    │ JSON-LD (@graph)    │   browser_meta           │
-    │ → httpx_meta        │ + Pillow нарезка → parts │
-    └─────────────────────┴──────────────────────────┘
-            │
-            ▼
-[merge_meta] Объединяем httpx_meta + browser_meta
-    title/description — берём ДЛИННЕЕ
-    price/brand/rating — браузер приоритетнее
-            │
-            ▼
-Есть parts (скриншот)?
-    ├─ ДА, 1 часть   → reply_photo + карточка
-    ├─ ДА, >1 часть  → reply_media_group, карточка на первой
-    └─ НЕТ           → reply текстом, только карточка
-            │
-            ▼
-Удаляем статусное сообщение
+User → Telegram
+  ↓
+aiogram Router (bot.py)
+  ├─ Фільтр бекологу: age > MAX_MSG_AGE (60 сек) → skip
+  ├─ URL_RE: витягуємо першу http(s) URL
+  ├─ security.is_safe() → блокуємо private IP
+  ├─ cache.get(url) → якщо є: відповідаємо одразу (кеш у пам'яті, TTL 300 сек)
+  └─ cache miss:
+       → reply WARNING_INSTANT (миттєве попередження до генерації)
+       → asyncio.gather(
+           metadata.fetch(url),    ← httpx, 5 User-Agent fallback
+           screenshot.shoot(url)   ← Playwright semaphore=1
+         )
+       → merge_meta(httpx_meta, browser_meta)
+       → reply_photo / reply_media_group / reply text-only
+       → cache.save(url, file_id)
+       → status.delete()
 ```
 
----
-
-## 4. Структура файлов
+### Файлова структура
 
 ```
-project/
-├── bot.py          # Хендлер сообщений, merge_meta, build_message, entities
-├── cache.py        # TTLCache: MD5(url) → file_id
-├── config.py       # BOT_TOKEN, таймауты, константы
-├── Dockerfile      # dumb-init + playwright + chromium
-├── main.py         # polling + FastAPI (/ping, /) параллельно
-├── metadata.py     # httpx fetch, _walk_jsonld, _parse
-├── render.yaml     # healthCheckPath /ping
+.
+├── bot.py          # Обробка повідомлень, build_message, merge_meta
+├── main.py         # Точка входу, Playwright init, polling + FastAPI
+├── screenshot.py   # Playwright: shoot(), init(), _split_image()
+├── metadata.py     # httpx: fetch(), _parse(), _walk_jsonld()
+├── security.py     # SSRF-фільтр: is_safe()
+├── cache.py        # TTLCache обгортка: get(), save()
+├── config.py       # ENV vars + константи
+├── Dockerfile      # playwright base image + dumb-init
+├── render.yaml     # Render Blueprint
 ├── requirements.txt
-├── screenshot.py   # Playwright, _route_handler, _split_image
-└── security.py     # SSRF + DNS rebinding
+├── .env.example
+├── .gitignore
+├── .dockerignore
+├── LICENSE         # MIT
+└── README.md
 ```
 
 ---
 
-## 5. Ключевые решения и ПОЧЕМУ
+## 4. Ключові рішення та їх причини
 
-### 5.1. SEMAPHORE = 1
-Только один скриншот за раз. **Почему:** Chromium при активной работе занимает 300–400 МБ. Render Free даёт 512 МБ на всё. Два одновременных скриншота = OOM crash.
+### 4.1 SEMAPHORE = 1
+Один скриншот одночасно. Два Chromium-контексти = ~600–700 МБ → OOM на 512 МБ Render Free. **Не змінювати без збільшення RAM.**
 
-### 5.2. Polling, а не Webhook
-**Почему:** Render Free усыпляет сервис через 15 минут без входящего HTTP-трафика. Webhook при этом теряется. Polling возобновляется после пробуждения. НО: Render следит только за inbound HTTP, polling-запросы не считаются активностью — поэтому нужен keep-alive пинг на `/ping`.
+### 4.2 dumb-init у Docker
+Без нього headless_shell Chromium після `browser.close()` залишається зомбі-процесом. dumb-init є PID 1 і коректно реапить дочірні процеси.  
+→ [Playwright Issue #34190](https://github.com/microsoft/playwright/issues/34190)
 
-### 5.3. wait_until="domcontentloaded", НЕ networkidle
-**Почему:** сайты с аналитикой, WebSocket, рекламой никогда не достигают networkidle — бот завис бы на каждом втором сайте.
+### 4.3 domcontentloaded замість networkidle
+networkidle вішає бота на сайтах з аналітикою та live-чатами (бесконечний трафік). domcontentloaded + `wait_for_timeout(PAUSE_MS=3000)` — баланс між швидкістю і JS-рендером.
 
-### 5.4. full_page=True + Pillow нарезка, MAX_HEIGHT=4000
-**Почему:** делаем один полный скриншот, потом режем готовое изображение через Pillow — нет проблем с координатами clip. MAX_HEIGHT ограничивает высоту: страницы 50000–200000px вызвали бы OOM. 4000px = ~3 части, достаточно для товарной страницы.
+### 4.4 Паралельний збір метаданих і скриншоту
+`asyncio.gather(metadata.fetch, screenshot.shoot)` — httpx і Playwright йдуть одночасно. Без цього час відповіді подвоюється.
 
-### 5.5. Slackbot User-Agent первым
-**Почему:** Cloudflare намеренно пропускает ботов соцсетей (Slack, Twitter, Facebook), иначе превью ссылок в этих сервисах сломались бы. Используем это для получения метаданных.
+### 4.5 merge_meta: довший title перемагає
+Browser бачить JS-рендер (SPA), httpx обходить Cloudflare. Беремо довший title/description з двох джерел. Ціна/бренд/рейтинг — звідки є.
 
-### 5.6. Метаданные из page.content() (браузер) + httpx параллельно
-**Почему:** некоторые сайты (Elmir, Rozetka) блокируют httpx но пускают реальный браузер. Берём из обоих источников и объединяем. browser_meta видит результат JS-рендера.
+### 4.6 _walk_jsonld з @graph
+Elmir, Rozetka, Comfy ховають Product не першим об'єктом, а всередині `@graph`. Рекурсивний обхід вирішує.
 
-### 5.7. _walk_jsonld с обходом @graph
-**Почему:** магазины кладут Product не первым элементом массива, а внутри `@graph` или после BreadcrumbList. Простой `data[0]` не находил товар. Рекурсивный обход находит Product где бы он ни был.
+### 4.7 PART_HEIGHT = 1280, MAX_PARTS = 4 → MAX_HEIGHT = 5120 px
+Telegram ліміт ~10 МБ на фото. 1280px @ 390px ширина @ 2x DPR ≈ 2–4 МБ. 4 частини = максимум що влізе без OOM на 512 МБ.
 
-### 5.8. merge_meta: длиннее title побеждает
-**Почему:** Elmir через httpx отдаёт title="Elmir.ua", а браузер — полное название товара. Берём длиннее. Для Cloudflare-сайтов наоборот: httpx даёт нормальный title, браузер пустой.
+### 4.8 Слабкий httpx fallback на Cloudflare
+User-Agent `Slackbot-LinkExpanding...` — Cloudflare пропускає ботів соцмереж. Fallback chain: Slack → Twitter → Facebook → 2× Chrome.
 
-### 5.9. Название в `code` entity
-**Почему:** Telegram показывает code-текст в рамке и копирует одним тапом — удобно для поиска товара в Google.
-
-### 5.10. Блокировка медиа, шрифтов, рекламы в _route_handler
-**Почему:** ускоряет загрузку, снижает RAM. НЕ блокируем googletagmanager — ломает некоторые сайты.
+### 4.9 Фільтр бекологу (MAX_MSG_AGE = 60 сек)
+Після рестарту бота в Telegram накопичуються сотні старих повідомлень. Фільтр за `msg.date` + `delete_webhook(drop_pending_updates=True)` — захист від масового спаму відповідями.
 
 ---
 
-## 6. Параметры (config.py)
+## 5. Поточний стан: що реалізовано
 
-```python
-BOT_TOKEN = os.environ["BOT_TOKEN"]   # из переменных окружения
-PORT = int(os.environ.get("PORT", 8000))  # Render подставляет сам
+### ✅ Готово і працює
 
-USER_AGENT = "Mozilla/5.0 ... Chrome/125.0.0.0 ..."  # для скриншота
-TIMEOUT_MS = 20_000   # таймаут загрузки страницы
-PAUSE_MS = 3_000      # пауза после domcontentloaded (для JS-рендера)
-SEMAPHORE = 1         # один скриншот за раз — защита от OOM
-CACHE_SIZE = 200      # записей в кэше
-CACHE_TTL = 300       # 5 минут
-```
+- Мгновенне попередження до генерації скриншоту
+- Паралельний збір метаданих (httpx) + скриншоту (Playwright)
+- Розумне злиття метаданих з двох джерел (`merge_meta`)
+- Нарізка довгих сторінок на частини через Pillow
+- Захист від бекологу після рестартів
+- SSRF-фільтр (private IP ranges)
+- In-memory TTL кеш (5 хв, 200 записів)
+- Блокування реклами, медіа, шрифтів у Playwright
+- Обхід cookie-банерів
+- dumb-init у Docker
+- FastAPI `/ping` та `/` для health check на Render
+- `.gitignore`, `.dockerignore`, `.env.example`, `LICENSE`, `README.md`
+- Структуроване логування (loguru) з RAM-мітками
 
-## 7. Параметры (screenshot.py)
+### ⚠️ Відомі обмеження (прийняті свідомо)
 
-```python
-MOBILE_WIDTH = 390    # iPhone мобильный viewport
-MOBILE_HEIGHT = 844
-MAX_HEIGHT = 4000     # макс. высота до нарезки (защита от OOM)
-PART_HEIGHT = 1280    # высота одной части для Telegram
-```
-
----
-
-## 8. Формат карточки (bot.py → build_message)
-
-```
-🌐 site_name
-📌 title         ← code entity: рамка + копирование одним тапом
-🏷 Бренд: brand
-💰 Ціна: price   ← bold entity
-⭐ rating
-
-📝 description (обрезается до 300 символов)
-
-━━━━━━━━━━━━━━━
-🛡 УВАГА!...     ← blockquote entity
-```
-
-Caption фото ограничен 1024 символами (Telegram), текстовое сообщение — 4096. Entities считаются в UTF-16 code units (особенность Telegram API).
+- Кеш живе тільки в пам'яті процесу — після рестарту скидається
+- SSRF-фільтр не перевіряє redirect-ланцюжки (DNS rebinding теоретично можливий)
+- Нема rate limiting — один користувач може заспамити
+- Браузер не перезапускається — після ~100+ запитів можливий повільний memory leak
 
 ---
 
-## 9. SSRF-фильтр (security.py)
+## 6. Черга завдань
 
-Проверяется IP после DNS-резолва (защита от DNS rebinding), не строка URL.
+### Рівень 1 — Стабільність (наступний крок)
 
-Блокируемые диапазоны:
-```
-127.0.0.0/8      loopback
-10.0.0.0/8       приватная сеть
-172.16.0.0/12    приватная сеть
-192.168.0.0/16   приватная сеть
-169.254.0.0/16   cloud metadata (169.254.169.254 — ключи AWS/GCP)
-100.64.0.0/10    shared address space
-198.18.0.0/15    benchmark
-224.0.0.0/4      multicast
-240.0.0.0/4      reserved
-fc00::/7, fe80::/10, ::1   IPv6
-```
+**Пріоритет: КРИТИЧНИЙ**
 
----
+#### 1.1 Rate limiting per user
+**Проблема**: без ліміту один юзер може відправити 50 посилань підряд → черга забивається → Playwright копить пам'ять → OOM → Render вбиває контейнер.  
+**Рішення**: middleware aiogram — 1 запит / 15 сек на user_id.  
+**Файл**: `bot.py` (middleware) або окремий `rate_limit.py`.  
+**Поведінка**: тихе ігнорування надлишкових запитів (без відповіді, щоб не спамити).
 
-## 10. Блокировка ресурсов (screenshot.py → _route_handler)
-
-```
-resource_type: media, websocket
-расширения: .woff .woff2 .ttf .otf .eot .mp4 .webm .avi .mov
-домены: doubleclick.net, googlesyndication.com, googleadservices.com,
-        adnxs.com, criteo.com, taboola.com, outbrain.com,
-        facebook.net, google-analytics.com, mc.yandex.ru, counter.yadro.ru
-```
+#### 1.2 Periodic browser restart
+**Проблема**: Playwright поступово накопичує пам'ять через internal page cache, V8 heap, накладні витрати контекстів.  
+→ [Playwright Issue #15400](https://github.com/microsoft/playwright/issues/15400)  
+**Рішення**: лічильник запитів у `screenshot.py`; кожні 50 скриншотів — `_browser.close()` + `init()`.  
+**Важливо**: перезапуск відбувається тільки між запитами (семафор захищає), не під час.  
+**Файл**: `screenshot.py`.
 
 ---
 
-## 11. Деплой (Render Free)
+### Рівень 2 — Безпека
 
-1. Repo на GitHub, runtime Docker
-2. Переменная окружения: `BOT_TOKEN`
-3. `PORT` — Render подставляет автоматически
-4. Keep-alive: UptimeRobot → GET `https://app.onrender.com/ping` каждые 14 минут
+**Пріоритет: СЕРЕДНІЙ**
 
----
+#### 2.1 SSRF-захист: перевірка після redirect
+**Проблема**: `socket.gethostbyname()` і реальний запрос Playwright — різні моменти. При DNS rebinding можна обійти фільтр.  
+**Рішення**: httpx HEAD-запит з `follow_redirects=True` → перевірка `final_url` через `is_safe()`.  
+**Файл**: `security.py` або `metadata.py` (до основного fetch).
 
-## 12. Известные проблемы и решения
-
-| Проблема | Причина | Решение |
-|---|---|---|
-| Cloudflare-сайты медленные/без скриншота | Datacenter IP Render в чёрном списке Cloudflare | Запуск локально (домашний IP) или residential proxy |
-| Elmir без цены | Цена рендерится JS после domcontentloaded | Увеличить PAUSE_MS (замедлит всё) |
-| TelegramConflictError при деплое | Render запускает 2 контейнера, оба делают polling | Settings → Delete or suspend → Suspend → Resume |
-| Скриншот падает timeout на Cloudflare | challenge-страница не дорисовывается | Бот отправляет только карточку — это штатно |
+#### 2.2 Healthcheck бота (не тільки FastAPI)
+**Проблема**: `/ping` підтверджує що FastAPI живий, але не що бот підключений до Telegram і браузер запущений.  
+**Рішення**: `/health` endpoint з перевіркою `_browser is not None`.  
+**Файл**: `main.py`.
 
 ---
 
-## 13. Запуск локально (без Docker)
+### Рівень 3 — Можливості (майбутнє)
+
+**Пріоритет: НИЗЬКИЙ / За бажанням**
+
+#### 3.1 OCR після скриншоту
+Запускати `pytesseract` або `easyocr` на скриншоті, шукати слова: `seed phrase`, `metamask`, `wallet`, `login`, `password`.  
+Додавати `⚠️ На сторінці виявлені підозрілі форми` до картки.  
+**Обмеження**: важкий пакет (~300 МБ), потребує більше RAM ніж є на Render Free.
+
+#### 3.2 VirusTotal / URLScan інтеграція
+Перевіряти URL через публічні API (безкоштовні ліміти).  
+`VirusTotal`: 4 запити/хвилину безкоштовно → `X / 92 vendors`.  
+`URLScan.io`: публічний scan → додаткові скриншоти з хмари.
+
+#### 3.3 Whitelist / Blacklist доменів
+`blocked_domains.txt`: автоматично блокувати *.tk, *.top, *.xyz — відомі фішинг-TLD.  
+`trusted_domains.txt`: rozetka.com.ua, amazon.com — скорочена відповідь без попередження.
+
+#### 3.4 Phishing score
+Аналізувати ознаки: вік домену (WHOIS), наявність форм логіну, редиректи, Cloudflare challenge.  
+Виводити: `🛡 Risk Score: 78/100` з переліком ознак.
+
+#### 3.5 Персистентний кеш
+Замінити `TTLCache` в пам'яті на `SQLite` (локально) або `Redis` (Upstash безкоштовний).  
+Кеш виживає після рестарту. Популярні посилання не перезнімаються.
+
+---
+
+## 7. Константи (config.py) — довідник
+
+| Константа | Значення | Чому |
+|-----------|----------|------|
+| `SEMAPHORE` | 1 | Два Chromium = OOM на 512 МБ |
+| `TIMEOUT_MS` | 20 000 | 20 сек — баланс швидкості і надійності |
+| `PAUSE_MS` | 3 000 | Чекаємо JS-рендер після domcontentloaded |
+| `MAX_PARTS` | 4 | Захист від OOM — 4 × 1280 px = 5120 px max |
+| `PART_HEIGHT` | 1 280 | Telegram ліміт ~10 МБ на фото |
+| `MAX_MSG_AGE` | 60 сек | Фільтр бекологу після рестарту |
+| `CACHE_SIZE` | 200 | Кількість URL у кеші |
+| `CACHE_TTL` | 300 сек | 5 хвилин — баланс між свіжістю і навантаженням |
+
+---
+
+## 8. Команди проекту
 
 ```bash
-pip install -r requirements.txt
-playwright install chromium
-BOT_TOKEN=ваш_токен python main.py
-```
+# Запушити зміни
+git add . && git commit -m "опис" && git push
 
-Преимущество: Cloudflare-сайты работают (домашний IP). Минус: только пока компьютер включён.
+# Форсований рестарт (TelegramConflictError або зависання)
+git commit --allow-empty -m "restart" && git push
 
----
-
-## 14. Как продолжить разработку в новом чате
-
-1. `git add . && git commit -m "stable" && git push` — сохранить состояние
-2. В новом чате вставить это ТЗ + вывод команды:
-```bash
+# Подивитись весь код
 find . -not -path './.git/*' | sort && echo "---" && for f in $(find . -name "*.py" -o -name "*.txt" -o -name "Dockerfile" | grep -v .git | sort); do echo "== $f =="; cat "$f"; done
+
+# Зберегти дамп проекту
+{ echo '# Дамп'; echo '```'; find . -not -path './.git/*' | sort; echo '```'; for f in $(find . -name "*.py" -o -name "*.txt" -o -name "Dockerfile" | grep -v .git | sort); do echo "## $f"; echo '```python'; cat "$f"; echo '```'; done; } > project_dump.md
 ```
-3. Код на GitHub — источник правды, не память Claude.
 
 ---
 
-*Документ отражает рабочее состояние проекта на момент версии 4.1.*
+## 9. Деплой
+
+**Поточне середовище**: Render Free  
+- 750 годин/місяць (~31 день для 1 сервісу)  
+- Sleep після 15 хв idle, cold start ~30–60 сек  
+- Shell недоступний — рестарт тільки через Suspend/Resume або порожній коміт  
+- Автодеплой: push у `main` → Render підхоплює  
+
+**Шлях до production 24/7**:
+1. Oracle Cloud Always Free ARM (4 OCPU, 24 ГБ RAM) — безкоштовно, але ARM вимагає додаткової настройки Playwright
+2. Hetzner CX22 (~€6/місяць) — найкращий price/performance для стабільного production
+
+---
+
+## 10. Версії TZ
+
+| Версія | Що змінилось |
+|--------|--------------|
+| v1–v3 | Початкові концепції, не збереглись |
+| v4.1 | Фінальна архітектура: single screenshot, asyncio паралелізм, Cloudflare fallback |
+| **v5.0** | Актуалізація під реальний код. Зафіксовано всі прийняті рішення та їх причини. Черга завдань: Рівень 1 (rate limit + browser restart), Рівень 2 (SSRF, healthcheck), Рівень 3 (OCR, VirusTotal, phishing score). |

@@ -9,6 +9,13 @@ from metadata import parse_from_html
 
 semaphore = asyncio.Semaphore(SEMAPHORE)
 _browser = None
+_pw = None  # держим playwright-инстанс чтобы корректно перезапускать браузер
+
+# Счётчик запросов — каждые RESTART_EVERY скриншотов перезапускаем браузер.
+# Playwright постепенно раздувает V8 heap и internal page cache.
+# 50 запросов — ~2–5 часов работы на Render Free при реальной нагрузке.
+_request_count = 0
+RESTART_EVERY = 50
 
 MOBILE_WIDTH = 390
 MOBILE_HEIGHT = 844
@@ -19,7 +26,7 @@ PART_HEIGHT = 1280
 # Скільки повних частин максимум обробляємо — захист від OOM на Render Free (512 МБ)
 MAX_PARTS = 4
 
-# Граничну висоту виводимо з PART_HEIGHT × MAX_PARTS — рівно стільки частин, без хвостика
+# Гранична висота: PART_HEIGHT × MAX_PARTS рівно без хвостика
 MAX_HEIGHT = PART_HEIGHT * MAX_PARTS  # 1280 × 4 = 5120 px
 
 COOKIE_SELECTORS = [
@@ -51,9 +58,9 @@ def log_ram(label: str):
     logger.info(f"[RAM | {label}] {mb:.1f} MB")
 
 async def init():
-    global _browser
-    pw = await async_playwright().start()
-    _browser = await pw.chromium.launch(
+    global _browser, _pw
+    _pw = await async_playwright().start()
+    _browser = await _pw.chromium.launch(
         headless=True,
         args=[
             "--no-sandbox",
@@ -73,6 +80,24 @@ async def init():
         ]
     )
     log_ram("Browser started")
+
+async def _restart_browser():
+    """Перезапуск браузера для сброса накопленной памяти Playwright.
+    Вызывается между запросами (семафор уже захвачен), поэтому безопасно."""
+    global _browser, _pw, _request_count
+    logger.info(f"[BROWSER RESTART] after {RESTART_EVERY} requests — clearing V8 heap")
+    log_ram("Before restart")
+    try:
+        await _browser.close()
+    except Exception as e:
+        logger.warning(f"Browser close error (non-critical): {e}")
+    try:
+        await _pw.stop()
+    except Exception as e:
+        logger.warning(f"Playwright stop error (non-critical): {e}")
+    await init()
+    _request_count = 0
+    log_ram("After restart")
 
 async def _route_handler(route):
     req = route.request
@@ -133,8 +158,16 @@ async def shoot(url: str) -> tuple[list[bytes], dict]:
     full_page=True — знімаємо всю сторінку.
     Потім ріжемо через Pillow — без проблем з координатами браузера.
     """
+    global _request_count
+
     log_ram("Before screenshot")
     async with semaphore:
+        # Перезапуск браузера кожні RESTART_EVERY запитів — скидаємо V8 heap і page cache.
+        # Виконується всередині семафору — жодного паралельного запиту в цей момент.
+        _request_count += 1
+        if _request_count >= RESTART_EVERY:
+            await _restart_browser()
+
         ctx = await _browser.new_context(
             viewport={"width": MOBILE_WIDTH, "height": MOBILE_HEIGHT},
             user_agent=USER_AGENT,

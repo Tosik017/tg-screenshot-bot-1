@@ -1,20 +1,46 @@
 import re, time, asyncio
 from datetime import datetime, timezone
-from aiogram import Router
-from aiogram.types import Message, BufferedInputFile, MessageEntity, InputMediaPhoto
+from aiogram import Router, BaseMiddleware
+from aiogram.types import Message, BufferedInputFile, MessageEntity, InputMediaPhoto, TelegramObject
+from typing import Any, Callable, Awaitable
 from loguru import logger
 import cache, security, screenshot, metadata
 
 router = Router()
 URL_RE = re.compile(r'https?://[^\s]+')
 
-# Сообщения старше этого возраста (сек) к моменту обработки — это бэклог или залп
-# в активном чате. Игнорим, чтобы не спамить ответами на устаревшие ссылки.
 MAX_MSG_AGE = 60
 
-# №1 — мгновенное предупреждение ДО генерации. Самое громкое: момент опасности,
-# человек вот-вот кликнет. 🚨⚠️ + СТОП оправданы (заметность +65% к защите).
-# Тайминг честный (1–2 мин по логам) — иначе человек ждёт «секунды» и кликает.
+# --- Rate limiting ---
+# Один запрос на 15 сек с user_id. Тихий дроп — без ответа, чтобы не спамить в чат.
+RATE_LIMIT_SEC = 15
+_rate_store: dict[int, float] = {}  # user_id → timestamp последнего запроса
+
+class RateLimitMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        if not isinstance(event, Message):
+            return await handler(event, data)
+
+        user_id = event.from_user.id if event.from_user else None
+        if user_id is None:
+            return await handler(event, data)
+
+        now = time.monotonic()
+        last = _rate_store.get(user_id, 0)
+        if now - last < RATE_LIMIT_SEC:
+            logger.info(f"RATE_LIMIT user={user_id} cooldown={RATE_LIMIT_SEC - (now - last):.1f}s")
+            return  # Тихий дроп
+        _rate_store[user_id] = now
+        return await handler(event, data)
+
+router.message.middleware(RateLimitMiddleware())
+
+# --- Сообщения ---
 WARNING_INSTANT = (
     "\n"
     "🚨⚠️ СТОП! НЕ ПЕРЕХОДЬТЕ ЗА ПОСИЛАННЯМ! ⚠️🚨\n"
@@ -23,8 +49,6 @@ WARNING_INSTANT = (
     "⏳ Зазвичай до 1–2 хвилин — не переходьте, дочекайтесь результату нижче. 👇"
 )
 
-# №2 — напоминание ПОСЛЕ, в рамке-цитате карточки. Сильный сигнал, но тише №1,
-# чтобы не было alarm fatigue. Иконки по ролям: 🚨 тревога / ⚠️ риск / 🔎 альтернатива.
 DISCLAIMER = (
     "🚨 УВАГА! Не довіряйте незнайомим посиланням.\n"
     "⚠️ Ніколи не вводьте паролі та дані картки на невідомих сайтах.\n"
@@ -89,39 +113,21 @@ def trim_caption(text: str, entities: list) -> tuple[str, list]:
     return text, entities
 
 def merge_meta(httpx_meta: dict, browser_meta: dict) -> dict:
-    """
-    Розумне злиття метаданих з двох джерел.
-    Title і description — беремо довший (браузер бачить JS, httpx обходить Cloudflare).
-    Ціна, бренд, рейтинг — беремо звідки є.
-    site_name, image — httpx надійніше.
-    """
     result = {}
-
-    # Title — беремо довший
     h_title = httpx_meta.get("title") or ""
     b_title = browser_meta.get("title") or ""
     result["title"] = b_title if len(b_title) > len(h_title) else h_title
-
-    # Description — беремо довший
     h_desc = httpx_meta.get("description") or ""
     b_desc = browser_meta.get("description") or ""
     result["description"] = b_desc if len(b_desc) > len(h_desc) else h_desc
-
-    # Ціна, бренд, рейтинг — беремо звідки є
     for key in ("price", "brand", "rating"):
         result[key] = browser_meta.get(key) or httpx_meta.get(key)
-
-    # site_name і image — httpx надійніше
     result["site_name"] = httpx_meta.get("site_name") or browser_meta.get("site_name")
     result["image"] = httpx_meta.get("image") or browser_meta.get("image")
-
     return result
 
 @router.message()
 async def handle(msg: Message):
-    # Защита от бэклога и залпов: если сообщение старше MAX_MSG_AGE к моменту
-    # обработки — бот разгребает очередь (рестарт) или завал в активном чате.
-    # msg.date в aiogram 3.x — timezone-aware datetime в UTC.
     age = (datetime.now(timezone.utc) - msg.date).total_seconds()
     if age > MAX_MSG_AGE:
         logger.info(f"SKIP stale msg age={age:.0f}s chat={msg.chat.id}")
@@ -139,7 +145,6 @@ async def handle(msg: Message):
         await msg.reply("🚫 Посилання веде на недоступний ресурс.")
         return
 
-    # Кэш
     cached_file_id = cache.get(url)
     if cached_file_id:
         meta = await metadata.fetch(url)
@@ -178,7 +183,6 @@ async def handle(msg: Message):
             cap_text, cap_entities = trim_caption(msg_text, msg_entities)
 
             if len(parts) == 1:
-                # Одна часть — фото с карточкой
                 sent = await msg.reply_photo(
                     photo=BufferedInputFile(parts[0], filename="preview.png"),
                     caption=cap_text,
@@ -187,8 +191,6 @@ async def handle(msg: Message):
                 if sent.photo:
                     cache.save(url, sent.photo[-1].file_id)
             else:
-                # Несколько частей — медиагруппа
-                # Карточка идёт к первой части
                 media = []
                 for i, part in enumerate(parts):
                     if i == 0:
@@ -202,13 +204,11 @@ async def handle(msg: Message):
                             media=BufferedInputFile(part, filename=f"part_{i+1}.png"),
                         ))
                 sent_list = await msg.reply_media_group(media=media)
-                # Кэшируем первое фото
                 if sent_list and sent_list[0].photo:
                     cache.save(url, sent_list[0].photo[-1].file_id)
 
             logger.info(f"OK+photo parts={len(parts)} url={url} time={elapsed:.1f}s")
         else:
-            # Скриншот не получился — только карточка
             await msg.reply(text=msg_text, entities=msg_entities)
             logger.info(f"OK+text url={url} time={elapsed:.1f}s")
 
