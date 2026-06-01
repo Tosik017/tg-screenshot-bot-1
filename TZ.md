@@ -212,6 +212,7 @@ Render шле SIGTERM при зупинці контейнера. Порядок
 ### Свідомо пропущено
 - VirusTotal — потребує реєстрацію API
 - Google Safe Browsing — потребує реєстрацію API
+- **Oracle Cloud Always Free** — не підходить для бота через idle reclaim policy (див. розділ 9)
 
 ---
 
@@ -277,16 +278,36 @@ find . -not -path './.git/*' | sort && echo "---" && for f in $(find . -name "*.
 
 ## 9. Деплой
 
-**Поточне середовище**: Render Free
+### Поточне середовище: Render Free
 - 750 годин/місяць
 - Sleep після 15 хв idle, cold start ~30–60 сек
 - Health Check Path: `/health` (не `/ping`)
+- Ephemeral диск (дані не зберігаються між рестартами)
 
 **TelegramConflictError при деплої** — Render Dashboard → Manual Deploy → Deploy latest commit.
 
-**Шлях до production 24/7**:
-1. Oracle Cloud Always Free ARM (4 OCPU, 24 ГБ RAM) — безкоштовно
-2. Hetzner CX22 (~€6/місяць) — найкращий price/performance
+### Платформи для production 24/7
+
+| Платформа | Ціна | RAM | Підходить |
+|-----------|------|-----|-----------|
+| **Hetzner CX22** | €4.51/міс | 4 ГБ | ✅ Найкращий price/performance |
+| **Contabo VPS S** | €4.50/міс | 8 ГБ | ✅ Бюджетний з великим RAM |
+| **Fly.io** | $0–5/міс | 256 МБ free | ⚠️ Free allowance, для маленьких ботів часто $0 |
+| **Self-hosted (Raspberry Pi 4)** | $0 | 4–8 ГБ | ✅ Якщо є залізо |
+
+### ❌ Oracle Cloud Always Free — НЕ підходить
+
+Спочатку здавалось привабливо (4 ARM OCPU + 24 ГБ RAM безкоштовно), але є критичні обмеження:
+
+1. **Idle reclaim policy**: Oracle відкликає інстанси якщо CPU < 20% за 7 днів. Telegram-бот основну частину часу idle → reclaim протягом тижня.
+2. **Account suspension без пояснень**: масові скарги на форумах Oracle і LowEndTalk про термінацію акаунтів через 30 днів навіть при нормальному використанні. Дані не відновлюються.
+3. **30 днів неактивності = abandoned**: акаунт може бути визнаний покинутим і призупинений/прекращений.
+4. **Out of host capacity для ARM**: дефіцит Ampere A1 у регіонах часто розтягується на тижні-місяці. Багато користувачів не можуть створити інстанс.
+5. **Карта обов'язкова**: hold-перевірки можуть не пройти з банками з України/Білорусії/Росії через санкційні та гео-обмеження.
+6. **Немає SLA**: офіційно без гарантій uptime.
+7. **ARM-архітектура**: Playwright base image `mcr.microsoft.com/playwright/python` — x86. Потрібна пересборка з `ubuntu:22.04-arm64` і ручна установка Chromium.
+
+**Висновок**: для бота з нерегулярним навантаженням Oracle Cloud — пастка з ризиком втрати акаунту.
 
 ---
 
@@ -307,4 +328,4 @@ find . -not -path './.git/*' | sort && echo "---" && for f in $(find . -name "*.
 | v4.1 | Single screenshot, asyncio паралелізм, Cloudflare fallback |
 | v5.0 | Актуалізація під реальний код, черга завдань по рівнях |
 | v5.1 | Додано: RateLimitMiddleware, browser restart, SSRF після редиректів, /health, blacklist, WHOIS, graceful shutdown |
-| **v5.2** | Відкочено v5.1 → stable-v1 → повернуто інфраструктурний слой (rate limit notify + /health + graceful shutdown). Додано: **Smart queue** (queue_manager.py — лімит/таймаут/позиція/дедуп) і **Smart cache** (cache.py — типізовані записи + диференційований TTL + negative). Helmет тегом `stable-v2`. Антифішинг (SSRF після редиректів, WHOIS, blacklist) — чекає поетапного повернення. |
+| **v5.2** | Відкочено v5.1 → stable-v1 → повернуто інфраструктурний слой (rate limit notify + /health + graceful shutdown). Додано: **Smart queue** (queue_manager.py — лімит/таймаут/позиція/дедуп) і **Smart cache** (cache.py — типізовані записи + диференційований TTL + negative). Помічено тегом `stable-v2`. Антифішинг (SSRF після редиректів, WHOIS, blacklist) — чекає поетапного повернення. **Видалено Oracle Cloud з рекомендованих платформ** — idle reclaim policy + ризик термінації акаунту. |
