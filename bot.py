@@ -1,4 +1,5 @@
 import re, time, asyncio
+from datetime import datetime, timezone
 from aiogram import Router
 from aiogram.types import Message, BufferedInputFile, MessageEntity, InputMediaPhoto
 from loguru import logger
@@ -6,6 +7,10 @@ import cache, security, screenshot, metadata
 
 router = Router()
 URL_RE = re.compile(r'https?://[^\s]+')
+
+# Сообщения старше этого возраста (сек) к моменту обработки — это бэклог или залп
+# в активном чате. Игнорим, чтобы не спамить ответами на устаревшие ссылки.
+MAX_MSG_AGE = 60
 
 WARNING_INSTANT = (
     "\n"
@@ -109,6 +114,14 @@ def merge_meta(httpx_meta: dict, browser_meta: dict) -> dict:
 
 @router.message()
 async def handle(msg: Message):
+    # Защита от бэклога и залпов: если сообщение старше MAX_MSG_AGE к моменту
+    # обработки — бот разгребает очередь (рестарт) или завал в активном чате.
+    # msg.date в aiogram 3.x — timezone-aware datetime в UTC.
+    age = (datetime.now(timezone.utc) - msg.date).total_seconds()
+    if age > MAX_MSG_AGE:
+        logger.info(f"SKIP stale msg age={age:.0f}s chat={msg.chat.id}")
+        return
+
     text = msg.text or msg.caption or ""
     urls = URL_RE.findall(text)
     if not urls:

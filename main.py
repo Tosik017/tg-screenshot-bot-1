@@ -22,14 +22,18 @@ async def main():
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
+
+    # Сброс накопленной очереди апдейтов ДО старта polling.
+    # ВАЖНО: drop_pending_updates нельзя передавать в start_polling — в aiogram 3.x
+    # этот kwarg уходит в workflow_data и молча игнорируется (no-op).
+    # Рабочий способ — отдельный вызов delete_webhook.
+    await bot.delete_webhook(drop_pending_updates=True)
+
     server = uvicorn.Server(
         uvicorn.Config(app, host="0.0.0.0", port=PORT)
     )
     await asyncio.gather(
-        # drop_pending_updates=True — сбрасываем очередь апдейтов, накопленную
-        # пока сервис спал на Render Free. Иначе бот обработает весь бэклог
-        # одним залпом и упадёт от лимитов Telegram.
-        dp.start_polling(bot, drop_pending_updates=True),
+        dp.start_polling(bot),
         server.serve()
     )
 
