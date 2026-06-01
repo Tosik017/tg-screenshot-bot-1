@@ -26,7 +26,10 @@ async def main():
         uvicorn.Config(app, host="0.0.0.0", port=PORT)
     )
     await asyncio.gather(
-        dp.start_polling(bot),
+        # drop_pending_updates=True — сбрасываем очередь апдейтов, накопленную
+        # пока сервис спал на Render Free. Иначе бот обработает весь бэклог
+        # одним залпом и упадёт от лимитов Telegram.
+        dp.start_polling(bot, drop_pending_updates=True),
         server.serve()
     )
 
