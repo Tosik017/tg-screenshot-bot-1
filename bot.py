@@ -12,9 +12,9 @@ URL_RE = re.compile(r'https?://[^\s]+')
 MAX_MSG_AGE = 60
 
 # --- Rate limiting ---
-# Один запрос на 15 сек с user_id. Тихий дроп — без ответа, чтобы не спамить в чат.
+# Один запрос на 5 сек с user_id. Уведомляем пользователя — чтобы знал почему бот молчит.
 RATE_LIMIT_SEC = 5
-_rate_store: dict[int, float] = {}  # user_id → timestamp последнего запроса
+_rate_store: dict[int, float] = {}
 
 class RateLimitMiddleware(BaseMiddleware):
     async def __call__(
@@ -33,8 +33,10 @@ class RateLimitMiddleware(BaseMiddleware):
         now = time.monotonic()
         last = _rate_store.get(user_id, 0)
         if now - last < RATE_LIMIT_SEC:
+            remaining = int(RATE_LIMIT_SEC - (now - last)) + 1
             logger.info(f"RATE_LIMIT user={user_id} cooldown={RATE_LIMIT_SEC - (now - last):.1f}s")
-            return  # Тихий дроп
+            await event.reply(f"⏳ Зачекайте {remaining} сек. перед наступним запитом.")
+            return
         _rate_store[user_id] = now
         return await handler(event, data)
 
