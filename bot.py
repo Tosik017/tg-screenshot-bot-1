@@ -128,7 +128,6 @@ def merge_meta(httpx_meta: dict, browser_meta: dict) -> dict:
     return result
 
 def _format_warning(position: int, is_duplicate: bool) -> str:
-    """Уровень B: видимость позиции в очереди."""
     if is_duplicate:
         return (
             "\n"
@@ -139,7 +138,6 @@ def _format_warning(position: int, is_duplicate: bool) -> str:
         )
     if position <= 1:
         return WARNING_INSTANT
-    # Грубая оценка: 60 сек на одну задачу впереди
     eta = position * 60
     return (
         "\n"
@@ -149,6 +147,34 @@ def _format_warning(position: int, is_duplicate: bool) -> str:
         f"📊 Ваша позиція в черзі: {position}. Орієнтовний час: ~{eta} сек.\n"
         "⏳ Не переходьте, дочекайтесь результату нижче. 👇"
     )
+
+async def _send_from_cache(msg: Message, url: str, entry: dict):
+    """Отправляет ответ из кэша по типу записи. Метаданные уже в entry — никаких httpx."""
+    kind = entry.get("kind")
+    meta = entry.get("meta") or {}
+
+    if meta and meta.get("title"):
+        msg_text, msg_entities = build_message(meta)
+    else:
+        msg_text, msg_entities = build_disclaimer_only()
+    cap_text, cap_entities = trim_caption(msg_text, msg_entities)
+
+    if kind == "photo":
+        await msg.reply_photo(
+            photo=entry["file_id"],
+            caption=cap_text,
+            caption_entities=cap_entities,
+        )
+    elif kind == "media_group":
+        media = []
+        for i, fid in enumerate(entry["file_ids"]):
+            if i == 0:
+                media.append(InputMediaPhoto(media=fid, caption=cap_text, caption_entities=cap_entities))
+            else:
+                media.append(InputMediaPhoto(media=fid))
+        await msg.reply_media_group(media=media)
+    elif kind == "text":
+        await msg.reply(text=msg_text, entities=msg_entities)
 
 @router.message()
 async def handle(msg: Message):
@@ -169,23 +195,23 @@ async def handle(msg: Message):
         await msg.reply("🚫 Посилання веде на недоступний ресурс.")
         return
 
-    # Cache hit — отвечаем мгновенно, минуя очередь.
-    cached_file_id = cache.get(url)
-    if cached_file_id:
-        meta = await metadata.fetch(url)
-        if meta and meta.get("title"):
-            msg_text, msg_entities = build_message(meta)
-        else:
-            msg_text, msg_entities = build_disclaimer_only()
-        cap_text, cap_entities = trim_caption(msg_text, msg_entities)
-        await msg.reply_photo(
-            photo=cached_file_id,
-            caption=cap_text,
-            caption_entities=cap_entities,
-        )
+    # Cache check — все типы включая negative
+    entry = cache.get(url)
+    if entry:
+        kind = entry.get("kind")
+        if kind == "failure":
+            # Negative cache hit — не дёргаем Playwright
+            await msg.reply(
+                f"🚫 Сторінка недоступна.\n"
+                f"Причина: {entry.get('failure_reason', 'unknown')}\n"
+                f"Спробуйте через декілька хвилин."
+            )
+            return
+        # Успешный кэш: photo / media_group / text — отвечаем мгновенно
+        await _send_from_cache(msg, url, entry)
         return
 
-    # Ставим в очередь
+    # Cache miss — ставим в очередь
     try:
         future, position, is_duplicate = await queue_manager.enqueue(url)
     except queue_manager.QueueFull:
@@ -198,13 +224,13 @@ async def handle(msg: Message):
     status = await msg.reply(_format_warning(position, is_duplicate))
     start = time.monotonic()
 
-    # Метаданные собираем параллельно с ожиданием очереди — не блокируем worker
     httpx_task = asyncio.create_task(metadata.fetch(url))
 
     try:
         parts, browser_meta = await future
     except Exception as e:
         logger.error(f"FAIL url={url} error={e}")
+        cache.save_failure(url, str(e)[:80])
         await status.edit_text("❌ Не вдалось обробити посилання.")
         return
 
@@ -231,7 +257,7 @@ async def handle(msg: Message):
                     caption_entities=cap_entities,
                 )
                 if sent.photo:
-                    cache.save(url, sent.photo[-1].file_id)
+                    cache.save_photo(url, sent.photo[-1].file_id, meta)
             else:
                 media = []
                 for i, part in enumerate(parts):
@@ -246,16 +272,25 @@ async def handle(msg: Message):
                             media=BufferedInputFile(part, filename=f"part_{i+1}.png"),
                         ))
                 sent_list = await msg.reply_media_group(media=media)
-                if sent_list and sent_list[0].photo:
-                    cache.save(url, sent_list[0].photo[-1].file_id)
+                if sent_list:
+                    file_ids = [s.photo[-1].file_id for s in sent_list if s.photo]
+                    if file_ids:
+                        cache.save_media_group(url, file_ids, meta)
 
             logger.info(f"OK+photo parts={len(parts)} url={url} time={elapsed:.1f}s")
         else:
+            # Скриншот не получился — кэшируем как text_only
             await msg.reply(text=msg_text, entities=msg_entities)
+            if meta and meta.get("title"):
+                cache.save_text_only(url, meta)
+            else:
+                # Совсем ничего не получили — это failure
+                cache.save_failure(url, "empty result")
             logger.info(f"OK+text url={url} time={elapsed:.1f}s")
 
     except Exception as e:
         logger.error(f"FAIL url={url} error={e}")
+        cache.save_failure(url, str(e)[:80])
         await status.edit_text("❌ Не вдалось обробити посилання.")
         return
 

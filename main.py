@@ -3,7 +3,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from aiogram import Bot, Dispatcher
 from bot import router
-import screenshot, queue_manager
+import screenshot, queue_manager, cache
 from config import BOT_TOKEN, PORT
 from loguru import logger
 
@@ -43,6 +43,7 @@ async def health():
             "browser": browser_ok,
             "bot": bot_ok,
             "queue": queue_manager.get_stats(),
+            "cache": cache.stats(),
         }
     )
 
