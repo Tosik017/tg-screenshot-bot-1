@@ -8,7 +8,9 @@ router = Router()
 URL_RE = re.compile(r'https?://[^\s]+')
 
 WARNING_INSTANT = (
-    "🚨 СТОП! Не переходьте за посиланням!\n\n"
+    "\n"
+    "🚨⚠️ СТОП! НЕ ПЕРЕХОДЬТЕ ЗА ПОСИЛАННЯМ! ⚠️🚨\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
     "⏳ Генерую безпечний попередній перегляд...\n"
     "Зачекайте — я покажу що там є, без ризику для вас."
 )
@@ -77,12 +79,32 @@ def trim_caption(text: str, entities: list) -> tuple[str, list]:
     return text, entities
 
 def merge_meta(httpx_meta: dict, browser_meta: dict) -> dict:
-    result = {**httpx_meta}
-    for key, value in browser_meta.items():
-        if value and (key not in result or not result[key]):
-            result[key] = value
-        if key in ("price", "rating", "brand") and value:
-            result[key] = value
+    """
+    Розумне злиття метаданих з двох джерел.
+    Title і description — беремо довший (браузер бачить JS, httpx обходить Cloudflare).
+    Ціна, бренд, рейтинг — беремо звідки є.
+    site_name, image — httpx надійніше.
+    """
+    result = {}
+
+    # Title — беремо довший
+    h_title = httpx_meta.get("title") or ""
+    b_title = browser_meta.get("title") or ""
+    result["title"] = b_title if len(b_title) > len(h_title) else h_title
+
+    # Description — беремо довший
+    h_desc = httpx_meta.get("description") or ""
+    b_desc = browser_meta.get("description") or ""
+    result["description"] = b_desc if len(b_desc) > len(h_desc) else h_desc
+
+    # Ціна, бренд, рейтинг — беремо звідки є
+    for key in ("price", "brand", "rating"):
+        result[key] = browser_meta.get(key) or httpx_meta.get(key)
+
+    # site_name і image — httpx надійніше
+    result["site_name"] = httpx_meta.get("site_name") or browser_meta.get("site_name")
+    result["image"] = httpx_meta.get("image") or browser_meta.get("image")
+
     return result
 
 @router.message()
