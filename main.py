@@ -3,7 +3,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from aiogram import Bot, Dispatcher
 from bot import router
-import screenshot
+import screenshot, queue_manager
 from config import BOT_TOKEN, PORT
 from loguru import logger
 
@@ -42,26 +42,15 @@ async def health():
             "status": status,
             "browser": browser_ok,
             "bot": bot_ok,
+            "queue": queue_manager.get_stats(),
         }
     )
 
 async def shutdown(dp: Dispatcher, server: uvicorn.Server):
-    """
-    Graceful shutdown при SIGTERM (Render останавливает контейнер при деплое).
-    Порядок важен:
-    1. Останавливаем polling — новые сообщения не принимаем
-    2. Ждём семафор — текущий скриншот должен завершиться
-    3. Закрываем браузер чисто — без zombie Chromium
-    4. Останавливаем HTTP-сервер
-    """
     logger.info("SIGTERM received — starting graceful shutdown")
-
-    # 1. Останавливаем aiogram polling
     await dp.stop_polling()
     logger.info("Polling stopped")
 
-    # 2. Ждём освобождения семафора — текущий скриншот завершается
-    # Таймаут 60 сек — максимальное время одного скриншота
     try:
         await asyncio.wait_for(screenshot.semaphore.acquire(), timeout=60)
         screenshot.semaphore.release()
@@ -69,7 +58,6 @@ async def shutdown(dp: Dispatcher, server: uvicorn.Server):
     except asyncio.TimeoutError:
         logger.warning("Semaphore timeout — forcing shutdown anyway")
 
-    # 3. Закрываем браузер
     if screenshot._browser is not None:
         try:
             await screenshot._browser.close()
@@ -84,7 +72,6 @@ async def shutdown(dp: Dispatcher, server: uvicorn.Server):
         except Exception as e:
             logger.warning(f"Playwright stop error: {e}")
 
-    # 4. Останавливаем uvicorn
     server.should_exit = True
     logger.info("Shutdown complete")
 
@@ -92,6 +79,10 @@ async def main():
     global _bot
 
     await screenshot.init()
+
+    # Очередь: регистрируем процессор и запускаем воркер
+    queue_manager.register_processor(screenshot.shoot)
+    queue_manager.start_worker()
 
     _bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
@@ -103,7 +94,6 @@ async def main():
         uvicorn.Config(app, host="0.0.0.0", port=PORT)
     )
 
-    # Регистрируем SIGTERM handler — Render шлёт его при остановке контейнера
     loop = asyncio.get_event_loop()
     loop.add_signal_handler(
         signal.SIGTERM,

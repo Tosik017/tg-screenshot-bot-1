@@ -4,7 +4,7 @@ from aiogram import Router, BaseMiddleware
 from aiogram.types import Message, BufferedInputFile, MessageEntity, InputMediaPhoto, TelegramObject
 from typing import Any, Callable, Awaitable
 from loguru import logger
-import cache, security, screenshot, metadata
+import cache, security, screenshot, metadata, queue_manager
 
 router = Router()
 URL_RE = re.compile(r'https?://[^\s]+')
@@ -12,7 +12,6 @@ URL_RE = re.compile(r'https?://[^\s]+')
 MAX_MSG_AGE = 60
 
 # --- Rate limiting ---
-# Один запрос на 5 сек с user_id. Уведомляем пользователя — чтобы знал почему бот молчит.
 RATE_LIMIT_SEC = 5
 _rate_store: dict[int, float] = {}
 
@@ -128,6 +127,29 @@ def merge_meta(httpx_meta: dict, browser_meta: dict) -> dict:
     result["image"] = httpx_meta.get("image") or browser_meta.get("image")
     return result
 
+def _format_warning(position: int, is_duplicate: bool) -> str:
+    """Уровень B: видимость позиции в очереди."""
+    if is_duplicate:
+        return (
+            "\n"
+            "🚨⚠️ СТОП! НЕ ПЕРЕХОДЬТЕ ЗА ПОСИЛАННЯМ! ⚠️🚨\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "🔁 Це посилання вже обробляється — почекайте результат разом з іншими.\n"
+            "⏳ Не переходьте, дочекайтесь результату нижче. 👇"
+        )
+    if position <= 1:
+        return WARNING_INSTANT
+    # Грубая оценка: 60 сек на одну задачу впереди
+    eta = position * 60
+    return (
+        "\n"
+        "🚨⚠️ СТОП! НЕ ПЕРЕХОДЬТЕ ЗА ПОСИЛАННЯМ! ⚠️🚨\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🛡 Готую безпечний перегляд сторінки.\n"
+        f"📊 Ваша позиція в черзі: {position}. Орієнтовний час: ~{eta} сек.\n"
+        "⏳ Не переходьте, дочекайтесь результату нижче. 👇"
+    )
+
 @router.message()
 async def handle(msg: Message):
     age = (datetime.now(timezone.utc) - msg.date).total_seconds()
@@ -147,6 +169,7 @@ async def handle(msg: Message):
         await msg.reply("🚫 Посилання веде на недоступний ресурс.")
         return
 
+    # Cache hit — отвечаем мгновенно, минуя очередь.
     cached_file_id = cache.get(url)
     if cached_file_id:
         meta = await metadata.fetch(url)
@@ -162,13 +185,30 @@ async def handle(msg: Message):
         )
         return
 
-    status = await msg.reply(WARNING_INSTANT)
+    # Ставим в очередь
+    try:
+        future, position, is_duplicate = await queue_manager.enqueue(url)
+    except queue_manager.QueueFull:
+        await msg.reply(
+            "⚠️ Бот зараз перевантажений (черга заповнена).\n"
+            "Будь ласка, спробуйте через хвилину."
+        )
+        return
+
+    status = await msg.reply(_format_warning(position, is_duplicate))
     start = time.monotonic()
 
+    # Метаданные собираем параллельно с ожиданием очереди — не блокируем worker
     httpx_task = asyncio.create_task(metadata.fetch(url))
-    shot_task = asyncio.create_task(screenshot.shoot(url))
 
-    httpx_meta, (parts, browser_meta) = await asyncio.gather(httpx_task, shot_task)
+    try:
+        parts, browser_meta = await future
+    except Exception as e:
+        logger.error(f"FAIL url={url} error={e}")
+        await status.edit_text("❌ Не вдалось обробити посилання.")
+        return
+
+    httpx_meta = await httpx_task
 
     meta = merge_meta(httpx_meta, browser_meta)
     logger.info(f"Final meta: title={meta.get('title')} price={meta.get('price')}")
