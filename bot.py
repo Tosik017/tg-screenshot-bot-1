@@ -13,7 +13,7 @@ MAX_MSG_AGE = 60
 
 # --- Rate limiting ---
 # Один запрос на 15 сек с user_id. Тихий дроп — без ответа, чтобы не спамить в чат.
-RATE_LIMIT_SEC = 15
+RATE_LIMIT_SEC = 5
 _rate_store: dict[int, float] = {}  # user_id → timestamp последнего запроса
 
 class RateLimitMiddleware(BaseMiddleware):
