@@ -1,0 +1,10 @@
+.git
+.gitignore
+.env
+.env.example
+*.md
+__pycache__
+.vscode
+.idea
+LICENSE
+project_dump.md
