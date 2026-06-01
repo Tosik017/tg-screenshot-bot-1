@@ -4,7 +4,7 @@ from aiogram import Router, BaseMiddleware
 from aiogram.types import Message, BufferedInputFile, MessageEntity, InputMediaPhoto, TelegramObject
 from typing import Any, Callable, Awaitable
 from loguru import logger
-import cache, security, screenshot, metadata
+import cache, security, screenshot, metadata, blacklist
 
 router = Router()
 URL_RE = re.compile(r'https?://[^\s]+')
@@ -141,9 +141,19 @@ async def handle(msg: Message):
     url = urls[0]
     screenshot.log_ram("Start request")
 
-    # Быстрая синхронная проверка — до WARNING_INSTANT
+    # Быстрая синхронная проверка SSRF — до WARNING_INSTANT
     if not security.is_safe(url):
         await msg.reply("🚫 Посилання веде на недоступний ресурс.")
+        return
+
+    # Проверка blacklist — до WARNING_INSTANT, мгновенно, без Playwright
+    blocked, reason = blacklist.is_blacklisted(url)
+    if blocked:
+        logger.info(f"BLACKLIST block url={url} reason={reason}")
+        await msg.reply(
+            "🚫 Це посилання заблоковано як фішингове.\n"
+            "⚠️ Не переходьте за ним і не вводьте жодних даних."
+        )
         return
 
     cached_file_id = cache.get(url)
@@ -173,7 +183,6 @@ async def handle(msg: Message):
         httpx_task, shot_task, ssrf_task
     )
 
-    # Если редирект привёл на приватный IP — блокируем постфактум
     if not redirect_safe:
         logger.warning(f"SSRF blocked after redirects: {url}")
         await status.edit_text("🚫 Посилання веде на недоступний ресурс (редирект).")

@@ -3,12 +3,12 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from aiogram import Bot, Dispatcher
 from bot import router
-import screenshot
+import screenshot, blacklist
 from config import BOT_TOKEN, PORT
 
 app = FastAPI()
 
-_bot: Bot | None = None  # держим ссылку для проверки в /health
+_bot: Bot | None = None
 
 @app.get("/")
 @app.head("/")
@@ -22,13 +22,8 @@ async def ping():
 
 @app.get("/health")
 async def health():
-    """
-    Реальная проверка состояния сервиса:
-    - browser: Playwright запущен и browser-объект существует
-    - bot: удалось получить getMe от Telegram API
-    Render видит HTTP 200 = всё ок, HTTP 503 = сервис нездоров.
-    """
     browser_ok = screenshot._browser is not None
+    blacklist_ok = len(blacklist._blacklisted) > 0
 
     bot_ok = False
     if _bot is not None:
@@ -47,6 +42,8 @@ async def health():
             "status": status,
             "browser": browser_ok,
             "bot": bot_ok,
+            "blacklist_domains": len(blacklist._blacklisted),
+            "blacklist_ok": blacklist_ok,
         }
     )
 
@@ -54,6 +51,10 @@ async def main():
     global _bot
 
     await screenshot.init()
+
+    # Загружаем фиды до старта polling — бот не обрабатывает запросы без blacklist
+    await blacklist.update()
+    blacklist.start_background_updater()
 
     _bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
