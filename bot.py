@@ -156,7 +156,7 @@ async def handle(msg: Message):
         msg_text, msg_entities = build_disclaimer_only()
 
     try:
-        if parts:  # відправляємо будь-який скриншот включно з Cloudflare
+        if parts:
             cap_text, cap_entities = trim_caption(msg_text, msg_entities)
 
             if len(parts) == 1:
