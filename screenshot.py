@@ -13,11 +13,14 @@ _browser = None
 MOBILE_WIDTH = 390
 MOBILE_HEIGHT = 844
 
-# Максимальная высота до обрезки — защита от OOM на Render Free
-MAX_HEIGHT = 4000  # ~3 частини для типової товарної сторінки
-
-# Максимальная высота одной части для отправки в Telegram
+# Висота однієї частини при нарізці — більше ризиковано: Telegram ліміт ~10 МБ на фото
 PART_HEIGHT = 1280
+
+# Скільки повних частин максимум обробляємо — захист від OOM на Render Free (512 МБ)
+MAX_PARTS = 4
+
+# Граничну висоту виводимо з PART_HEIGHT × MAX_PARTS — рівно стільки частин, без хвостика
+MAX_HEIGHT = PART_HEIGHT * MAX_PARTS  # 1280 × 4 = 5120 px
 
 COOKIE_SELECTORS = [
     "button[id*='accept']",
@@ -92,25 +95,25 @@ async def _route_handler(route):
 
 def _split_image(png_bytes: bytes) -> list[bytes]:
     """
-    Умная нарезка через Pillow.
-    Делает из одного большого PNG список частей по PART_HEIGHT пикселей.
-    Максимальная высота ограничена MAX_HEIGHT — защита от OOM.
+    Розумна нарізка через Pillow.
+    Робить з одного великого PNG список частин по PART_HEIGHT пікселів.
+    Максимальна висота обмежена MAX_HEIGHT = PART_HEIGHT × MAX_PARTS — захист від OOM.
     """
     img = Image.open(BytesIO(png_bytes))
     width, height = img.size
 
-    # Защита от огромных страниц
+    # Захист від величезних сторінок (50000+ px зустрічаються)
     if height > MAX_HEIGHT:
         img = img.crop((0, 0, width, MAX_HEIGHT))
         height = MAX_HEIGHT
 
-    # Если страница короче одной части — возвращаем как есть
+    # Якщо сторінка коротша за одну частину — повертаємо як є
     if height <= PART_HEIGHT:
         buf = BytesIO()
         img.save(buf, format="PNG")
         return [buf.getvalue()]
 
-    # Нарезаем на части
+    # Ріжемо на частини
     parts = []
     top = 0
     while top < height:
@@ -126,9 +129,9 @@ def _split_image(png_bytes: bytes) -> list[bytes]:
 
 async def shoot(url: str) -> tuple[list[bytes], dict]:
     """
-    Возвращает (список частей скриншота, метаданные).
-    full_page=True — снимаем всю страницу.
-    Потом нарезаем через Pillow — без проблем с координатами браузера.
+    Повертає (список частин скриншота, метадані).
+    full_page=True — знімаємо всю сторінку.
+    Потім ріжемо через Pillow — без проблем з координатами браузера.
     """
     log_ram("Before screenshot")
     async with semaphore:
@@ -150,7 +153,7 @@ async def shoot(url: str) -> tuple[list[bytes], dict]:
             await page.wait_for_timeout(PAUSE_MS)
             await _close_cookies(page)
 
-            # Метаданные из браузера
+            # Метадані з браузера
             html = await page.content()
             browser_meta = parse_from_html(html, url)
             logger.info(
@@ -158,7 +161,7 @@ async def shoot(url: str) -> tuple[list[bytes], dict]:
                 f"price={browser_meta.get('price')}"
             )
 
-            # Полная страница одним снимком
+            # Повна сторінка одним знімком
             full_png = await page.screenshot(
                 full_page=True,
                 animations="disabled",
@@ -166,7 +169,7 @@ async def shoot(url: str) -> tuple[list[bytes], dict]:
             )
             log_ram("After screenshot")
 
-            # Нарезаем через Pillow
+            # Ріжемо через Pillow
             parts = _split_image(full_png)
             return parts, browser_meta
 
