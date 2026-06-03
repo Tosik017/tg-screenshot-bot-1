@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from aiogram import Router, Bot
 from aiogram.types import (
     Message, BufferedInputFile, MessageEntity, InputMediaPhoto,
-    ChatMemberUpdated, ReactionTypeEmoji,
+    ChatMemberUpdated, ReactionTypeEmoji, ChatPermissions,
 )
 from cachetools import TTLCache
 from loguru import logger
@@ -12,28 +12,29 @@ import cache, security, screenshot, metadata, queue_manager
 
 # aiogram 3.7: msg.reply* сами проставляют message_thread_id из исходного
 # сообщения — вручную НЕ передаём (иначе дубликат kwarg → TypeError).
+# bot.send_message тред НЕ проставляет сам → ему message_thread_id передаём явно.
 
 router = Router()
 URL_RE = re.compile(r'https?://[^\s]+')
 
 MAX_MSG_AGE = 60
 
-# --- Анти-спам дубликатами (эскалация + софт-бан) ---
+# --- Анти-спам дубликатами: эскалация + реальный mute ---
+# ПАМЯТЬ: ничего на диск, всё в bounded TTLCache (maxsize + ttl → не растёт).
+# Активный бан хранит САМ Telegram (restrictChatMember + until_date), у нас 0 байт.
 RATE_LIMIT_SEC = 5          # пейсинг РАЗНЫХ ссылок от одного юзера
-DUP_WINDOW_SEC = 120        # окно, где повторы ОДНОЙ ссылки считаются спамом
+DUP_WINDOW_SEC = 120        # окно, где повторы ОДНОЙ ссылки = спам
 STRIKE_DECAY_SEC = 120      # тишина 2 мин → счётчик предупреждений обнуляется
-BAN_SEC = 300               # софт-бан 5 минут
+BAN_SEC = 300               # mute 5 мин; Telegram сам снимает по until_date
 
-# Время последнего РАЗРЕШЁННОГО запроса на user_id (общий 5-сек пейсинг).
 _rate_store: TTLCache = TTLCache(maxsize=10_000, ttl=RATE_LIMIT_SEC)
-# Кому уже показали "Зачекайте" в этом окне — чтобы не спамить.
 _rate_notified: TTLCache = TTLCache(maxsize=10_000, ttl=RATE_LIMIT_SEC)
-# (chat,user,url) → True: эта ссылка уже обслужена этому юзеру в этом чате (в окне).
+# (chat,user,url) → True: ссылка уже обслужена этому юзеру в этом чате (в окне).
 _dup_seen: TTLCache = TTLCache(maxsize=20_000, ttl=DUP_WINDOW_SEC)
-# (chat,user) → strike: уровень эскалации предупреждений.
+# (chat,user) → strike: уровень эскалации.
 _strikes: TTLCache = TTLCache(maxsize=10_000, ttl=STRIKE_DECAY_SEC)
-# (chat,user) → True: активный софт-бан (бот игнорирует запросы юзера).
-_banned: TTLCache = TTLCache(maxsize=10_000, ttl=BAN_SEC)
+# (chat,user) → message_id: одно эскалирующее уведомление, редактируем на месте.
+_warn_msg: TTLCache = TTLCache(maxsize=10_000, ttl=STRIKE_DECAY_SEC)
 
 def _rate_cooldown(user_id: int) -> int:
     """Остаток кулдауна в секундах (0 = можно). При 0 — фиксирует текущий запрос."""
@@ -45,47 +46,84 @@ def _rate_cooldown(user_id: int) -> int:
     _rate_store[user_id] = time.monotonic()
     return 0
 
-# --- Реакция на сообщение ---
-# 👀 — из дефолтного набора реакций, работает в обычных группах без прав админа.
-# Если реакции запрещены в чате — молча пропускаем.
+# --- Модераторские примитивы (мягко падают, если прав/условий нет) ---
 async def _react(bot: Bot, msg: Message, emoji: str):
     try:
         await bot.set_message_reaction(
-            chat_id=msg.chat.id,
-            message_id=msg.message_id,
+            chat_id=msg.chat.id, message_id=msg.message_id,
             reaction=[ReactionTypeEmoji(emoji=emoji)],
         )
     except Exception as e:
-        logger.info(f"react skipped chat={msg.chat.id} emoji={emoji}: {e}")
+        logger.info(f"react skipped chat={msg.chat.id}: {e}")
+
+async def _delete(bot: Bot, chat_id: int, message_id: int):
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception as e:
+        logger.info(f"delete skipped chat={chat_id} msg={message_id}: {e}")
+
+async def _mute(bot: Bot, chat_id: int, user_id: int, seconds: int) -> bool:
+    """Реальный mute в Telegram. until_date → Telegram сам снимает, нам хранить нечего."""
+    try:
+        await bot.restrict_chat_member(
+            chat_id=chat_id,
+            user_id=user_id,
+            permissions=ChatPermissions(can_send_messages=False),
+            until_date=int(time.time()) + seconds,
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"mute failed chat={chat_id} user={user_id}: {e}")
+        return False
+
+async def _notice(bot: Bot, msg: Message, skey: tuple, text: str):
+    """Одно эскалирующее уведомление: редактируем на месте, не плодим новые."""
+    mid = _warn_msg.get(skey)
+    if mid:
+        try:
+            await bot.edit_message_text(text=text, chat_id=msg.chat.id, message_id=mid)
+            return
+        except Exception:
+            pass  # сообщение удалили/устарело → отправим новое
+    try:
+        sent = await bot.send_message(
+            chat_id=msg.chat.id, text=text,
+            message_thread_id=msg.message_thread_id,  # в тот же топик
+        )
+        _warn_msg[skey] = sent.message_id
+    except Exception as e:
+        logger.warning(f"notice failed chat={msg.chat.id}: {e}")
 
 async def _handle_duplicate_spam(bot: Bot, msg: Message, chat_id: int, user_id: int):
-    """
-    Эскалация на повтор того же URL этим юзером: 👀 → ⏳ → ⚠️ → 🛑 → 🚫 (бан 5 мин).
-    Счётчик strike живёт STRIKE_DECAY_SEC и обнуляется при тишине.
-    """
+    """Эскалация на повтор того же URL: 🗑+⏳ → 🗑+⚠️ → 🗑+🛑 → 🗑+🚫 mute 5 хв."""
     skey = (chat_id, user_id)
     strike = _strikes.get(skey, 0) + 1
     _strikes[skey] = strike
     logger.info(f"DUP_SPAM chat={chat_id} user={user_id} strike={strike}")
 
+    name = (msg.from_user.first_name if msg.from_user else None) or "Користувач"
+
+    # Чистим дубликат из чата.
+    await _delete(bot, chat_id, msg.message_id)
+
     if strike == 1:
-        await _react(bot, msg, "👀")
+        text = f"⏳ {name}, це посилання вже в обробці.\nНе дублюйте — результат буде нижче. 👇"
     elif strike == 2:
-        await msg.reply("⏳ Це посилання вже в обробці — не дублюйте.\nРезультат буде нижче. 👇")
+        text = f"⚠️ {name}, досить дублювати те саме посилання.\nЗупиніться, будь ласка."
     elif strike == 3:
-        await msg.reply("⚠️ Досить надсилати те саме посилання.\nЗупиніться, будь ласка.")
-    elif strike == 4:
-        await msg.reply("🛑 Останнє попередження!\nЩе один повтор — і пауза на 5 хвилин. 🔇")
-    else:  # strike >= 5 → софт-бан
-        _banned[skey] = True
-        await msg.reply(
-            f"🚫 Пауза {BAN_SEC // 60} хвилин.\n"
-            "Забагато повторів одного посилання поспіль.\n"
-            "Поверніться трохи згодом. ⏱"
-        )
+        text = f"🛑 {name}, ОСТАННЄ попередження!\nЩе раз — і пауза на {BAN_SEC // 60} хв. 🔇"
+    else:  # strike >= 4 → реальный mute
+        if await _mute(bot, chat_id, user_id, BAN_SEC):
+            text = (f"🚫 {name} — ПАУЗА {BAN_SEC // 60} хв.\n"
+                    f"За спам одним посиланням. Повтори видаляються.\n"
+                    f"Поверніться трохи згодом. ⏱")
+        else:
+            text = (f"🚫 {name}, спам зафіксовано.\n"
+                    f"Припиніть — інакше повтори видалятимуться.")
+
+    await _notice(bot, msg, skey, text)
 
 # --- Привязка к группам + доверие админам ---
-# Кэш админов: chat_id → set(user_ids). TTL 5 мин — состав админов меняется редко.
 _admin_cache: TTLCache = TTLCache(maxsize=64, ttl=300)
 
 async def _get_admin_ids(bot: Bot, chat_id: int) -> set[int]:
@@ -102,7 +140,7 @@ async def _get_admin_ids(bot: Bot, chat_id: int) -> set[int]:
         return set()
 
 async def _is_trusted_sender(bot: Bot, msg: Message) -> bool:
-    """True → отправитель доверенный (админ), ссылку не проверяем и не штрафуем."""
+    """True → админ: ни проверок, ни лимитов, ни мьюта."""
     if msg.sender_chat and msg.sender_chat.id == msg.chat.id:
         return True
     if msg.chat.type not in ("group", "supergroup"):
@@ -113,10 +151,6 @@ async def _is_trusted_sender(bot: Bot, msg: Message) -> bool:
 
 @router.my_chat_member()
 async def on_my_chat_member(event: ChatMemberUpdated, bot: Bot):
-    """
-    Меняется членство САМОГО бота. Лог chat_id — для настройки ALLOWED_GROUP_IDS.
-    Топики роли не играют: chat.id один на всю форум-супергруппу.
-    """
     chat = event.chat
     status = event.new_chat_member.status
     logger.info(f"MY_CHAT_MEMBER chat_id={chat.id} type={chat.type} title={chat.title!r} status={status}")
@@ -234,7 +268,6 @@ def _format_warning(position: int) -> str:
     )
 
 async def _send_from_cache(msg: Message, url: str, entry: dict):
-    """Отправляет ответ из кэша по типу записи. Метаданные уже в entry — никаких httpx."""
     kind = entry.get("kind")
     meta = entry.get("meta") or {}
 
@@ -264,7 +297,6 @@ async def handle(msg: Message, bot: Bot):
         logger.info(f"SKIP stale msg age={age:.0f}s chat={msg.chat.id}")
         return
 
-    # Привязка к группам.
     if ALLOWED_GROUP_IDS and msg.chat.id not in ALLOWED_GROUP_IDS:
         if msg.chat.type in ("group", "supergroup", "channel"):
             logger.warning(f"Message in non-allowed chat {msg.chat.id} — leaving")
@@ -277,9 +309,9 @@ async def handle(msg: Message, bot: Bot):
     text = msg.text or msg.caption or ""
     urls = URL_RE.findall(text)
     if not urls:
-        return  # нет ссылки → ни обработки, ни лимитов
+        return
 
-    # Админы — мимо всех ограничений (лимит/дедуп/бан их не касаются).
+    # Админы — мимо всего (лимит/дедуп/удаление/мьют их не касаются).
     if await _is_trusted_sender(bot, msg):
         uid = msg.from_user.id if msg.from_user else "anon"
         logger.info(f"SKIP trusted sender user={uid} chat={msg.chat.id}")
@@ -289,22 +321,15 @@ async def handle(msg: Message, bot: Bot):
     chat_id = msg.chat.id
     user_id = msg.from_user.id if msg.from_user else None
 
-    # --- Анти-спам (только для идентифицируемых не-админов) ---
     if user_id is not None:
-        bkey = (chat_id, user_id)
-
-        # 1) Активный софт-бан → молча игнорируем.
-        if bkey in _banned:
-            logger.info(f"BANNED skip chat={chat_id} user={user_id}")
-            return
-
-        # 2) Повтор той же ссылки этим юзером → эскалация (без обработки и без rate-limit).
+        # Повтор той же ссылки этим юзером → эскалация (удаление + предупреждение/мьют).
         if (chat_id, user_id, url) in _dup_seen:
             _dup_seen[(chat_id, user_id, url)] = True  # держим окно живым, пока спамят
             await _handle_duplicate_spam(bot, msg, chat_id, user_id)
             return
 
-        # 3) Общий пейсинг РАЗНЫХ ссылок. Дубли сюда не доходят.
+        # Общий пейсинг РАЗНЫХ ссылок. Дубли сюда не доходят. Распознанные разные
+        # ссылки не удаляем — это легитимные запросы, просто слишком частые.
         cooldown = _rate_cooldown(user_id)
         if cooldown:
             logger.info(f"RATE_LIMIT user={user_id} cooldown={cooldown}s")
@@ -313,8 +338,7 @@ async def handle(msg: Message, bot: Bot):
                 await msg.reply(f"⏳ Зачекайте {cooldown} сек. перед наступним запитом.")
             return
 
-        # Принимаем в работу → помечаем (chat,user,url) обслуженным.
-        _dup_seen[(chat_id, user_id, url)] = True
+        _dup_seen[(chat_id, user_id, url)] = True  # принимаем в работу
 
     screenshot.log_ram("Start request")
 
@@ -322,7 +346,6 @@ async def handle(msg: Message, bot: Bot):
         await msg.reply("🚫 Посилання веде на недоступний ресурс.")
         return
 
-    # Cache check — все типы включая negative.
     entry = cache.get(url)
     if entry:
         kind = entry.get("kind")
@@ -336,12 +359,10 @@ async def handle(msg: Message, bot: Bot):
         await _send_from_cache(msg, url, entry)
         return
 
-    # Cache miss — в очередь. Ключ дедупа очереди — (chat, thread, url).
     dest_key = (chat_id, msg.message_thread_id, url)
     try:
         future, position, is_duplicate = await queue_manager.enqueue(dest_key, url)
     except queue_manager.QueueFull:
-        # Не штрафуем за переполнение очереди — снимаем отметку, пусть повторят.
         if user_id is not None:
             _dup_seen.pop((chat_id, user_id, url), None)
         await msg.reply(
