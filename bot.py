@@ -1,59 +1,42 @@
 import re, time, asyncio
 from datetime import datetime, timezone
-from aiogram import Router, BaseMiddleware, Bot
+from aiogram import Router, Bot
 from aiogram.types import (
-    Message, BufferedInputFile, MessageEntity, InputMediaPhoto,
-    TelegramObject, ChatMemberUpdated,
+    Message, BufferedInputFile, MessageEntity, InputMediaPhoto, ChatMemberUpdated,
 )
-from typing import Any, Callable, Awaitable
 from cachetools import TTLCache
 from loguru import logger
 from config import ALLOWED_GROUP_IDS
 import cache, security, screenshot, metadata, queue_manager
 
-# ВАЖНО про топики: aiogram 3.7 shortcuts msg.reply / reply_photo / reply_media_group
-# САМИ берут тред из исходного сообщения (self.message_thread_id) и подставляют в
-# SendMessage. Поэтому вручную тред НЕ передаём — это давало дубликат kwarg и TypeError.
-# Ответ и так уходит в тот же топик форум-группы.
+# aiogram 3.7: msg.reply* сами проставляют message_thread_id из исходного
+# сообщения — вручную НЕ передаём (иначе дубликат kwarg → TypeError).
 
 router = Router()
 URL_RE = re.compile(r'https?://[^\s]+')
 
 MAX_MSG_AGE = 60
 
-# --- Rate limiting ---
+# --- Rate limiting (только на реальные запросы со ссылкой; не на болтовню/админов) ---
 RATE_LIMIT_SEC = 5
-_rate_store: dict[int, float] = {}
+# Время последнего РАЗРЕШЁННОГО запроса на user_id. TTLCache сам чистит записи по
+# истечении окна — без ручной чистки и без утечки памяти.
+_rate_store: TTLCache = TTLCache(maxsize=10_000, ttl=RATE_LIMIT_SEC)
+# Кому уже показали уведомление о кулдауне в этом окне — чтобы не спамить чат.
+_rate_notified: TTLCache = TTLCache(maxsize=10_000, ttl=RATE_LIMIT_SEC)
 
-class RateLimitMiddleware(BaseMiddleware):
-    async def __call__(
-        self,
-        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
-        event: TelegramObject,
-        data: dict[str, Any],
-    ) -> Any:
-        if not isinstance(event, Message):
-            return await handler(event, data)
-
-        user_id = event.from_user.id if event.from_user else None
-        if user_id is None:
-            return await handler(event, data)
-
-        now = time.monotonic()
-        last = _rate_store.get(user_id, 0)
-        if now - last < RATE_LIMIT_SEC:
-            remaining = int(RATE_LIMIT_SEC - (now - last)) + 1
-            logger.info(f"RATE_LIMIT user={user_id} cooldown={RATE_LIMIT_SEC - (now - last):.1f}s")
-            await event.reply(f"⏳ Зачекайте {remaining} сек. перед наступним запитом.")
-            return
-        _rate_store[user_id] = now
-        return await handler(event, data)
-
-router.message.middleware(RateLimitMiddleware())
+def _rate_cooldown(user_id: int) -> int:
+    """Остаток кулдауна в секундах (0 = можно). При 0 — фиксирует текущий запрос."""
+    last = _rate_store.get(user_id)
+    if last is not None:
+        remaining = RATE_LIMIT_SEC - (time.monotonic() - last)
+        if remaining > 0:
+            return int(remaining) + 1
+    _rate_store[user_id] = time.monotonic()
+    return 0
 
 # --- Привязка к группам + доверие админам ---
-# Кэш админов: chat_id → set(user_ids). TTL 5 мин — состав админов меняется редко,
-# но один get_chat_administrators раз в 5 мин дешевле, чем API на каждое сообщение.
+# Кэш админов: chat_id → set(user_ids). TTL 5 мин — состав админов меняется редко.
 _admin_cache: TTLCache = TTLCache(maxsize=64, ttl=300)
 
 async def _get_admin_ids(bot: Bot, chat_id: int) -> set[int]:
@@ -76,7 +59,6 @@ async def _is_trusted_sender(bot: Bot, msg: Message) -> bool:
     # Анонимный админ постит от имени самой группы (sender_chat == chat).
     if msg.sender_chat and msg.sender_chat.id == msg.chat.id:
         return True
-    # Понятие «админ» есть только в группах/супергруппах.
     if msg.chat.type not in ("group", "supergroup"):
         return False
     if not msg.from_user:
@@ -87,19 +69,15 @@ async def _is_trusted_sender(bot: Bot, msg: Message) -> bool:
 async def on_my_chat_member(event: ChatMemberUpdated, bot: Bot):
     """
     Срабатывает когда меняется членство САМОГО бота (добавили/удалили/повысили).
-    Штатный способ ловить добавление в чат — точнее и дешевле проверки на сообщениях.
-    Лог chat_id здесь же используется для первичной настройки ALLOWED_GROUP_IDS.
+    Лог chat_id используется для первичной настройки ALLOWED_GROUP_IDS.
     Топики роли не играют: chat.id один на всю форум-супергруппу.
     """
     chat = event.chat
     status = event.new_chat_member.status  # member / administrator / restricted / left / kicked
     logger.info(f"MY_CHAT_MEMBER chat_id={chat.id} type={chat.type} title={chat.title!r} status={status}")
 
-    # Список не задан → ограничение выключено, ниоткуда не выходим (но лог выше есть).
     if not ALLOWED_GROUP_IDS:
         return
-
-    # В личке выйти нельзя (leave_chat только для групп/каналов) — игнорируем.
     if chat.type == "private":
         return
 
@@ -197,15 +175,7 @@ def merge_meta(httpx_meta: dict, browser_meta: dict) -> dict:
     result["image"] = httpx_meta.get("image") or browser_meta.get("image")
     return result
 
-def _format_warning(position: int, is_duplicate: bool) -> str:
-    if is_duplicate:
-        return (
-            "\n"
-            "🚨⚠️ СТОП! НЕ ПЕРЕХОДЬТЕ ЗА ПОСИЛАННЯМ! ⚠️🚨\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            "🔁 Це посилання вже обробляється — почекайте результат разом з іншими.\n"
-            "⏳ Не переходьте, дочекайтесь результату нижче. 👇"
-        )
+def _format_warning(position: int) -> str:
     if position <= 1:
         return WARNING_INSTANT
     eta = position * 60
@@ -253,8 +223,7 @@ async def handle(msg: Message, bot: Bot):
         logger.info(f"SKIP stale msg age={age:.0f}s chat={msg.chat.id}")
         return
 
-    # Привязка к группам: если список задан и это другой чат — не обрабатываем.
-    # Для групп ещё и выходим (страховка, если my_chat_member не сработал).
+    # Привязка к группам: чужой чат → не обрабатываем (для групп ещё и выходим).
     if ALLOWED_GROUP_IDS and msg.chat.id not in ALLOWED_GROUP_IDS:
         if msg.chat.type in ("group", "supergroup", "channel"):
             logger.warning(f"Message in non-allowed chat {msg.chat.id} — leaving")
@@ -267,15 +236,25 @@ async def handle(msg: Message, bot: Bot):
     text = msg.text or msg.caption or ""
     urls = URL_RE.findall(text)
     if not urls:
-        return
+        return  # нет ссылки → ни обработки, ни rate limit (не реагируем на болтовню)
 
-    # Доверие админам: ссылка от админа группы считается доверенной — пропускаем
-    # без проверки и без ответа. Проверяем ТОЛЬКО когда в сообщении есть ссылка,
-    # чтобы не дёргать API на каждое сообщение.
+    # Доверие админам — ДО rate limit: на админов лимит не распространяется.
     if await _is_trusted_sender(bot, msg):
         uid = msg.from_user.id if msg.from_user else "anon"
         logger.info(f"SKIP trusted sender user={uid} chat={msg.chat.id}")
         return
+
+    # Rate limit — ТОЛЬКО на реальный запрос (ссылка, не-админ).
+    # Сообщение о кулдауне шлём один раз за окно, чтобы не спамить чат.
+    user_id = msg.from_user.id if msg.from_user else None
+    if user_id is not None:
+        cooldown = _rate_cooldown(user_id)
+        if cooldown:
+            logger.info(f"RATE_LIMIT user={user_id} cooldown={cooldown}s")
+            if user_id not in _rate_notified:
+                _rate_notified[user_id] = True
+                await msg.reply(f"⏳ Зачекайте {cooldown} сек. перед наступним запитом.")
+            return
 
     url = urls[0]
     screenshot.log_ram("Start request")
@@ -289,20 +268,19 @@ async def handle(msg: Message, bot: Bot):
     if entry:
         kind = entry.get("kind")
         if kind == "failure":
-            # Negative cache hit — не дёргаем Playwright
             await msg.reply(
                 f"🚫 Сторінка недоступна.\n"
                 f"Причина: {entry.get('failure_reason', 'unknown')}\n"
                 f"Спробуйте через декілька хвилин."
             )
             return
-        # Успешный кэш: photo / media_group / text — отвечаем мгновенно
         await _send_from_cache(msg, url, entry)
         return
 
-    # Cache miss — ставим в очередь
+    # Cache miss — в очередь. Ключ дедупа учитывает чат и топик.
+    dest_key = (msg.chat.id, msg.message_thread_id, url)
     try:
-        future, position, is_duplicate = await queue_manager.enqueue(url)
+        future, position, is_duplicate = await queue_manager.enqueue(dest_key, url)
     except queue_manager.QueueFull:
         await msg.reply(
             "⚠️ Бот зараз перевантажений (черга заповнена).\n"
@@ -310,7 +288,14 @@ async def handle(msg: Message, bot: Bot):
         )
         return
 
-    status = await msg.reply(_format_warning(position, is_duplicate))
+    if is_duplicate:
+        # Этот URL уже обрабатывается для ЭТОГО чата/топика. Оригинальный запрос сам
+        # пришлёт скриншот сюда — дубль молча выходит. Иначе тот же скриншот ушёл бы
+        # N раз → Telegram Flood control (SendMediaGroup) и "❌" на проигравших.
+        logger.info(f"DUPLICATE skip url={url} chat={msg.chat.id} thread={msg.message_thread_id}")
+        return
+
+    status = await msg.reply(_format_warning(position))
     start = time.monotonic()
 
     httpx_task = asyncio.create_task(metadata.fetch(url))
@@ -368,12 +353,10 @@ async def handle(msg: Message, bot: Bot):
 
             logger.info(f"OK+photo parts={len(parts)} url={url} time={elapsed:.1f}s")
         else:
-            # Скриншот не получился — кэшируем как text_only
             await msg.reply(text=msg_text, entities=msg_entities)
             if meta and meta.get("title"):
                 cache.save_text_only(url, meta)
             else:
-                # Совсем ничего не получили — это failure
                 cache.save_failure(url, "empty result")
             logger.info(f"OK+text url={url} time={elapsed:.1f}s")
 

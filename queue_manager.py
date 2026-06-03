@@ -2,77 +2,74 @@
 Умная очередь для запросов на скриншот.
 - Уровень A: лимит глубины + глобальный таймаут на задачу
 - Уровень B: видимость позиции в очереди для пользователя
-- Уровень C: in-flight дедупликация одинаковых URL
+- Уровень C: дедупликация по (chat_id, thread_id, url)
 """
 import asyncio
 from dataclasses import dataclass, field
 from loguru import logger
 
 # --- Конфигурация ---
-# Максимум задач в очереди. На 12-м запросе бот отвечает "перегружен" вместо
-# вставания в очередь. Защита от лавины апдейтов после рестарта или флуда.
+# Максимум задач в очереди. На переполнении бот отвечает "перегружен".
 MAX_QUEUE_SIZE = 10
 
-# Глобальный таймаут на одну задачу: Playwright TIMEOUT_MS=20000 — внутренний
-# таймаут навигации, но скриншот после navigation может зависнуть.
+# Глобальный таймаут на одну задачу.
 # 90 сек = 20 (goto) + 3 (pause) + 20 (screenshot) + 47 (запас).
 TASK_TIMEOUT_SEC = 90
+
+# Ключ дедупликации: (chat_id, thread_id, url).
+# Один и тот же URL в одном и том же чате+топике обрабатывается один раз.
+# Тот же URL в другом чате/топике — отдельная задача (каждому адресату свой ответ).
+DedupKey = tuple[int, "int | None", str]
 
 @dataclass
 class QueueTask:
     """Задача в очереди. Future освобождается воркером с результатом."""
+    key: DedupKey
     url: str
     future: asyncio.Future = field(default_factory=asyncio.Future)
-    position: int = 0  # обновляется воркером перед стартом обработки
+    position: int = 0  # позиция на момент enqueue (для UX)
 
 class QueueFull(Exception):
     """Очередь заполнена — бот перегружен."""
     pass
 
 # --- Состояние ---
-# Очередь активных задач (FIFO). asyncio.Queue для естественного await.
 _queue: asyncio.Queue[QueueTask] = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
 
-# In-flight cache: url → Future. Если URL уже обрабатывается,
-# второй запрос подцепляется к существующему Future вместо новой задачи.
-# Очищается ПОСЛЕ освобождения Future.
-_inflight: dict[str, asyncio.Future] = {}
+# In-flight: dedup-ключ → Future. Второй запрос с тем же ключом подцепляется
+# к существующему Future и НЕ создаёт новую задачу. Чистится воркером после задачи.
+_inflight: dict[DedupKey, asyncio.Future] = {}
 
 # Воркер — единственный обработчик очереди (соответствует SEMAPHORE=1).
-_worker_task: asyncio.Task | None = None
+_worker_task: "asyncio.Task | None" = None
 
-# Callback для обработки задачи. Регистрируется из main.py.
-# Принимает url, возвращает (parts: list[bytes], browser_meta: dict).
+# Callback реальной работы (screenshot.shoot). Принимает url → (parts, browser_meta).
 _processor = None
 
 def register_processor(processor):
-    """Регистрация функции которая делает реальную работу (screenshot.shoot)."""
     global _processor
     _processor = processor
 
-async def enqueue(url: str) -> tuple[asyncio.Future, int, bool]:
+async def enqueue(key: DedupKey, url: str) -> tuple[asyncio.Future, int, bool]:
     """
-    Ставит URL в очередь. Возвращает (future, position, is_duplicate).
-    - future: ожидаемый результат
-    - position: позиция в очереди на момент enqueue (для UX)
-    - is_duplicate: True если URL уже обрабатывается (дедупликация)
-
+    Ставит (key, url) в очередь. Возвращает (future, position, is_duplicate).
+    - is_duplicate=True → этот URL уже обрабатывается для ЭТОГО чата+топика.
+      Вызывающий должен молча выйти (НЕ ждать future, НЕ слать второй результат) —
+      оригинальный запрос сам пришлёт скриншот в этот чат.
     Бросает QueueFull если очередь заполнена.
     """
-    # Уровень C: дедупликация. Если URL уже обрабатывается — отдаём тот же Future.
-    if url in _inflight:
-        logger.info(f"QUEUE dedup url={url} — attaching to in-flight task")
-        return _inflight[url], 0, True
+    # Уровень C: дедупликация по чату+топику+url.
+    if key in _inflight:
+        logger.info(f"QUEUE dedup key={key} — already in-flight")
+        return _inflight[key], 0, True
 
-    # Уровень A: проверка лимита глубины ДО добавления.
+    # Уровень A: лимит глубины ДО добавления.
     if _queue.qsize() >= MAX_QUEUE_SIZE:
         logger.warning(f"QUEUE full ({_queue.qsize()}/{MAX_QUEUE_SIZE}) — rejecting url={url}")
         raise QueueFull()
 
-    task = QueueTask(url=url)
-    _inflight[url] = task.future
-
-    # Позиция = текущий размер очереди до добавления + 1 (учёт активной задачи воркера если есть)
+    task = QueueTask(key=key, url=url)
+    _inflight[key] = task.future
     position = _queue.qsize() + 1
     task.position = position
 
@@ -87,8 +84,6 @@ async def _worker():
         task = await _queue.get()
         try:
             logger.info(f"QUEUE processing url={task.url} qsize_remaining={_queue.qsize()}")
-
-            # Уровень A: глобальный таймаут на задачу.
             try:
                 result = await asyncio.wait_for(
                     _processor(task.url),
@@ -104,19 +99,15 @@ async def _worker():
                 logger.error(f"QUEUE task failed url={task.url} error={e}")
                 if not task.future.done():
                     task.future.set_exception(e)
-
         finally:
-            # Очищаем in-flight — следующий запрос на этот URL создаст новую задачу
-            _inflight.pop(task.url, None)
+            _inflight.pop(task.key, None)
             _queue.task_done()
 
 def start_worker():
-    """Запускает фоновый воркер. Вызывается из main.py после init."""
     global _worker_task
     _worker_task = asyncio.create_task(_worker())
 
 def get_stats() -> dict:
-    """Для /health и отладки."""
     return {
         "queue_size": _queue.qsize(),
         "queue_max": MAX_QUEUE_SIZE,
