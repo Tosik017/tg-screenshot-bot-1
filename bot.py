@@ -2,7 +2,8 @@ import re, time, asyncio
 from datetime import datetime, timezone
 from aiogram import Router, Bot
 from aiogram.types import (
-    Message, BufferedInputFile, MessageEntity, InputMediaPhoto, ChatMemberUpdated,
+    Message, BufferedInputFile, MessageEntity, InputMediaPhoto,
+    ChatMemberUpdated, ReactionTypeEmoji,
 )
 from cachetools import TTLCache
 from loguru import logger
@@ -34,6 +35,20 @@ def _rate_cooldown(user_id: int) -> int:
             return int(remaining) + 1
     _rate_store[user_id] = time.monotonic()
     return 0
+
+# --- Реакция на сообщение (для дубликатов) ---
+# Лёгкое подтверждение эмодзи вместо текста/повторного скриншота: ноль засорения
+# чата. 👀 — из дефолтного набора реакций, работает в обычных группах без прав
+# админа. Если реакции в чате запрещены — молча пропускаем (анти-спам важнее).
+async def _react(bot: Bot, msg: Message, emoji: str):
+    try:
+        await bot.set_message_reaction(
+            chat_id=msg.chat.id,
+            message_id=msg.message_id,
+            reaction=[ReactionTypeEmoji(emoji=emoji)],
+        )
+    except Exception as e:
+        logger.info(f"react skipped chat={msg.chat.id} emoji={emoji}: {e}")
 
 # --- Привязка к группам + доверие админам ---
 # Кэш админов: chat_id → set(user_ids). TTL 5 мин — состав админов меняется редко.
@@ -274,6 +289,7 @@ async def handle(msg: Message, bot: Bot):
                 f"Спробуйте через декілька хвилин."
             )
             return
+        # Кэш-хит (успех): шлём превью повторно — новому спрашивающему нужно его увидеть.
         await _send_from_cache(msg, url, entry)
         return
 
@@ -290,9 +306,10 @@ async def handle(msg: Message, bot: Bot):
 
     if is_duplicate:
         # Этот URL уже обрабатывается для ЭТОГО чата/топика. Оригинальный запрос сам
-        # пришлёт скриншот сюда — дубль молча выходит. Иначе тот же скриншот ушёл бы
-        # N раз → Telegram Flood control (SendMediaGroup) и "❌" на проигравших.
-        logger.info(f"DUPLICATE skip url={url} chat={msg.chat.id} thread={msg.message_thread_id}")
+        # пришлёт скриншот сюда. Дубль НЕ дублируем (иначе N копий → Flood control),
+        # а реагируем 👀 на сообщение: «побачив, результат буде нижче».
+        logger.info(f"DUPLICATE inflight url={url} chat={msg.chat.id} thread={msg.message_thread_id} — react 👀")
+        await _react(bot, msg, "👀")
         return
 
     status = await msg.reply(_format_warning(position))
