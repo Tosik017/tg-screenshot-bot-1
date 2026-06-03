@@ -11,6 +11,11 @@ from loguru import logger
 from config import ALLOWED_GROUP_IDS
 import cache, security, screenshot, metadata, queue_manager
 
+# ВАЖНО про топики: aiogram 3.7 shortcuts msg.reply / reply_photo / reply_media_group
+# САМИ берут тред из исходного сообщения (self.message_thread_id) и подставляют в
+# SendMessage. Поэтому вручную тред НЕ передаём — это давало дубликат kwarg и TypeError.
+# Ответ и так уходит в тот же топик форум-группы.
+
 router = Router()
 URL_RE = re.compile(r'https?://[^\s]+')
 
@@ -39,11 +44,7 @@ class RateLimitMiddleware(BaseMiddleware):
         if now - last < RATE_LIMIT_SEC:
             remaining = int(RATE_LIMIT_SEC - (now - last)) + 1
             logger.info(f"RATE_LIMIT user={user_id} cooldown={RATE_LIMIT_SEC - (now - last):.1f}s")
-            # message_thread_id — чтобы ответ попал в тот же топик форум-группы
-            await event.reply(
-                f"⏳ Зачекайте {remaining} сек. перед наступним запитом.",
-                message_thread_id=event.message_thread_id,
-            )
+            await event.reply(f"⏳ Зачекайте {remaining} сек. перед наступним запитом.")
             return
         _rate_store[user_id] = now
         return await handler(event, data)
@@ -221,7 +222,6 @@ async def _send_from_cache(msg: Message, url: str, entry: dict):
     """Отправляет ответ из кэша по типу записи. Метаданные уже в entry — никаких httpx."""
     kind = entry.get("kind")
     meta = entry.get("meta") or {}
-    thread_id = msg.message_thread_id  # тот же топик форум-группы
 
     if meta and meta.get("title"):
         msg_text, msg_entities = build_message(meta)
@@ -234,7 +234,6 @@ async def _send_from_cache(msg: Message, url: str, entry: dict):
             photo=entry["file_id"],
             caption=cap_text,
             caption_entities=cap_entities,
-            message_thread_id=thread_id,
         )
     elif kind == "media_group":
         media = []
@@ -243,9 +242,9 @@ async def _send_from_cache(msg: Message, url: str, entry: dict):
                 media.append(InputMediaPhoto(media=fid, caption=cap_text, caption_entities=cap_entities))
             else:
                 media.append(InputMediaPhoto(media=fid))
-        await msg.reply_media_group(media=media, message_thread_id=thread_id)
+        await msg.reply_media_group(media=media)
     elif kind == "text":
-        await msg.reply(text=msg_text, entities=msg_entities, message_thread_id=thread_id)
+        await msg.reply(text=msg_text, entities=msg_entities)
 
 @router.message()
 async def handle(msg: Message, bot: Bot):
@@ -279,11 +278,10 @@ async def handle(msg: Message, bot: Bot):
         return
 
     url = urls[0]
-    thread_id = msg.message_thread_id  # тот же топик форум-группы во всех ответах
     screenshot.log_ram("Start request")
 
     if not security.is_safe(url):
-        await msg.reply("🚫 Посилання веде на недоступний ресурс.", message_thread_id=thread_id)
+        await msg.reply("🚫 Посилання веде на недоступний ресурс.")
         return
 
     # Cache check — все типы включая negative
@@ -295,8 +293,7 @@ async def handle(msg: Message, bot: Bot):
             await msg.reply(
                 f"🚫 Сторінка недоступна.\n"
                 f"Причина: {entry.get('failure_reason', 'unknown')}\n"
-                f"Спробуйте через декілька хвилин.",
-                message_thread_id=thread_id,
+                f"Спробуйте через декілька хвилин."
             )
             return
         # Успешный кэш: photo / media_group / text — отвечаем мгновенно
@@ -309,12 +306,11 @@ async def handle(msg: Message, bot: Bot):
     except queue_manager.QueueFull:
         await msg.reply(
             "⚠️ Бот зараз перевантажений (черга заповнена).\n"
-            "Будь ласка, спробуйте через хвилину.",
-            message_thread_id=thread_id,
+            "Будь ласка, спробуйте через хвилину."
         )
         return
 
-    status = await msg.reply(_format_warning(position, is_duplicate), message_thread_id=thread_id)
+    status = await msg.reply(_format_warning(position, is_duplicate))
     start = time.monotonic()
 
     httpx_task = asyncio.create_task(metadata.fetch(url))
@@ -348,7 +344,6 @@ async def handle(msg: Message, bot: Bot):
                     photo=BufferedInputFile(parts[0], filename="preview.png"),
                     caption=cap_text,
                     caption_entities=cap_entities,
-                    message_thread_id=thread_id,
                 )
                 if sent.photo:
                     cache.save_photo(url, sent.photo[-1].file_id, meta)
@@ -365,7 +360,7 @@ async def handle(msg: Message, bot: Bot):
                         media.append(InputMediaPhoto(
                             media=BufferedInputFile(part, filename=f"part_{i+1}.png"),
                         ))
-                sent_list = await msg.reply_media_group(media=media, message_thread_id=thread_id)
+                sent_list = await msg.reply_media_group(media=media)
                 if sent_list:
                     file_ids = [s.photo[-1].file_id for s in sent_list if s.photo]
                     if file_ids:
@@ -374,7 +369,7 @@ async def handle(msg: Message, bot: Bot):
             logger.info(f"OK+photo parts={len(parts)} url={url} time={elapsed:.1f}s")
         else:
             # Скриншот не получился — кэшируем как text_only
-            await msg.reply(text=msg_text, entities=msg_entities, message_thread_id=thread_id)
+            await msg.reply(text=msg_text, entities=msg_entities)
             if meta and meta.get("title"):
                 cache.save_text_only(url, meta)
             else:
