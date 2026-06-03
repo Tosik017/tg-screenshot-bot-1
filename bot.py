@@ -18,13 +18,22 @@ URL_RE = re.compile(r'https?://[^\s]+')
 
 MAX_MSG_AGE = 60
 
-# --- Rate limiting (только на реальные запросы со ссылкой; не на болтовню/админов) ---
-RATE_LIMIT_SEC = 5
-# Время последнего РАЗРЕШЁННОГО запроса на user_id. TTLCache сам чистит записи по
-# истечении окна — без ручной чистки и без утечки памяти.
+# --- Анти-спам дубликатами (эскалация + софт-бан) ---
+RATE_LIMIT_SEC = 5          # пейсинг РАЗНЫХ ссылок от одного юзера
+DUP_WINDOW_SEC = 120        # окно, где повторы ОДНОЙ ссылки считаются спамом
+STRIKE_DECAY_SEC = 120      # тишина 2 мин → счётчик предупреждений обнуляется
+BAN_SEC = 300               # софт-бан 5 минут
+
+# Время последнего РАЗРЕШЁННОГО запроса на user_id (общий 5-сек пейсинг).
 _rate_store: TTLCache = TTLCache(maxsize=10_000, ttl=RATE_LIMIT_SEC)
-# Кому уже показали уведомление о кулдауне в этом окне — чтобы не спамить чат.
+# Кому уже показали "Зачекайте" в этом окне — чтобы не спамить.
 _rate_notified: TTLCache = TTLCache(maxsize=10_000, ttl=RATE_LIMIT_SEC)
+# (chat,user,url) → True: эта ссылка уже обслужена этому юзеру в этом чате (в окне).
+_dup_seen: TTLCache = TTLCache(maxsize=20_000, ttl=DUP_WINDOW_SEC)
+# (chat,user) → strike: уровень эскалации предупреждений.
+_strikes: TTLCache = TTLCache(maxsize=10_000, ttl=STRIKE_DECAY_SEC)
+# (chat,user) → True: активный софт-бан (бот игнорирует запросы юзера).
+_banned: TTLCache = TTLCache(maxsize=10_000, ttl=BAN_SEC)
 
 def _rate_cooldown(user_id: int) -> int:
     """Остаток кулдауна в секундах (0 = можно). При 0 — фиксирует текущий запрос."""
@@ -36,10 +45,9 @@ def _rate_cooldown(user_id: int) -> int:
     _rate_store[user_id] = time.monotonic()
     return 0
 
-# --- Реакция на сообщение (для дубликатов) ---
-# Лёгкое подтверждение эмодзи вместо текста/повторного скриншота: ноль засорения
-# чата. 👀 — из дефолтного набора реакций, работает в обычных группах без прав
-# админа. Если реакции в чате запрещены — молча пропускаем (анти-спам важнее).
+# --- Реакция на сообщение ---
+# 👀 — из дефолтного набора реакций, работает в обычных группах без прав админа.
+# Если реакции запрещены в чате — молча пропускаем.
 async def _react(bot: Bot, msg: Message, emoji: str):
     try:
         await bot.set_message_reaction(
@@ -49,6 +57,32 @@ async def _react(bot: Bot, msg: Message, emoji: str):
         )
     except Exception as e:
         logger.info(f"react skipped chat={msg.chat.id} emoji={emoji}: {e}")
+
+async def _handle_duplicate_spam(bot: Bot, msg: Message, chat_id: int, user_id: int):
+    """
+    Эскалация на повтор того же URL этим юзером: 👀 → ⏳ → ⚠️ → 🛑 → 🚫 (бан 5 мин).
+    Счётчик strike живёт STRIKE_DECAY_SEC и обнуляется при тишине.
+    """
+    skey = (chat_id, user_id)
+    strike = _strikes.get(skey, 0) + 1
+    _strikes[skey] = strike
+    logger.info(f"DUP_SPAM chat={chat_id} user={user_id} strike={strike}")
+
+    if strike == 1:
+        await _react(bot, msg, "👀")
+    elif strike == 2:
+        await msg.reply("⏳ Це посилання вже в обробці — не дублюйте.\nРезультат буде нижче. 👇")
+    elif strike == 3:
+        await msg.reply("⚠️ Досить надсилати те саме посилання.\nЗупиніться, будь ласка.")
+    elif strike == 4:
+        await msg.reply("🛑 Останнє попередження!\nЩе один повтор — і пауза на 5 хвилин. 🔇")
+    else:  # strike >= 5 → софт-бан
+        _banned[skey] = True
+        await msg.reply(
+            f"🚫 Пауза {BAN_SEC // 60} хвилин.\n"
+            "Забагато повторів одного посилання поспіль.\n"
+            "Поверніться трохи згодом. ⏱"
+        )
 
 # --- Привязка к группам + доверие админам ---
 # Кэш админов: chat_id → set(user_ids). TTL 5 мин — состав админов меняется редко.
@@ -64,14 +98,11 @@ async def _get_admin_ids(bot: Bot, chat_id: int) -> set[int]:
         _admin_cache[chat_id] = ids  # кешируем ТОЛЬКО успех
         return ids
     except Exception as e:
-        # На ошибке не считаем никого админом и НЕ кешируем: ссылку проверим
-        # (безопасный дефолт), а на следующем сообщении повторим запрос.
         logger.warning(f"get_chat_administrators failed chat={chat_id}: {e}")
         return set()
 
 async def _is_trusted_sender(bot: Bot, msg: Message) -> bool:
-    """True → отправитель доверенный (админ), ссылку не проверяем."""
-    # Анонимный админ постит от имени самой группы (sender_chat == chat).
+    """True → отправитель доверенный (админ), ссылку не проверяем и не штрафуем."""
     if msg.sender_chat and msg.sender_chat.id == msg.chat.id:
         return True
     if msg.chat.type not in ("group", "supergroup"):
@@ -83,12 +114,11 @@ async def _is_trusted_sender(bot: Bot, msg: Message) -> bool:
 @router.my_chat_member()
 async def on_my_chat_member(event: ChatMemberUpdated, bot: Bot):
     """
-    Срабатывает когда меняется членство САМОГО бота (добавили/удалили/повысили).
-    Лог chat_id используется для первичной настройки ALLOWED_GROUP_IDS.
+    Меняется членство САМОГО бота. Лог chat_id — для настройки ALLOWED_GROUP_IDS.
     Топики роли не играют: chat.id один на всю форум-супергруппу.
     """
     chat = event.chat
-    status = event.new_chat_member.status  # member / administrator / restricted / left / kicked
+    status = event.new_chat_member.status
     logger.info(f"MY_CHAT_MEMBER chat_id={chat.id} type={chat.type} title={chat.title!r} status={status}")
 
     if not ALLOWED_GROUP_IDS:
@@ -215,11 +245,7 @@ async def _send_from_cache(msg: Message, url: str, entry: dict):
     cap_text, cap_entities = trim_caption(msg_text, msg_entities)
 
     if kind == "photo":
-        await msg.reply_photo(
-            photo=entry["file_id"],
-            caption=cap_text,
-            caption_entities=cap_entities,
-        )
+        await msg.reply_photo(photo=entry["file_id"], caption=cap_text, caption_entities=cap_entities)
     elif kind == "media_group":
         media = []
         for i, fid in enumerate(entry["file_ids"]):
@@ -238,7 +264,7 @@ async def handle(msg: Message, bot: Bot):
         logger.info(f"SKIP stale msg age={age:.0f}s chat={msg.chat.id}")
         return
 
-    # Привязка к группам: чужой чат → не обрабатываем (для групп ещё и выходим).
+    # Привязка к группам.
     if ALLOWED_GROUP_IDS and msg.chat.id not in ALLOWED_GROUP_IDS:
         if msg.chat.type in ("group", "supergroup", "channel"):
             logger.warning(f"Message in non-allowed chat {msg.chat.id} — leaving")
@@ -251,18 +277,34 @@ async def handle(msg: Message, bot: Bot):
     text = msg.text or msg.caption or ""
     urls = URL_RE.findall(text)
     if not urls:
-        return  # нет ссылки → ни обработки, ни rate limit (не реагируем на болтовню)
+        return  # нет ссылки → ни обработки, ни лимитов
 
-    # Доверие админам — ДО rate limit: на админов лимит не распространяется.
+    # Админы — мимо всех ограничений (лимит/дедуп/бан их не касаются).
     if await _is_trusted_sender(bot, msg):
         uid = msg.from_user.id if msg.from_user else "anon"
         logger.info(f"SKIP trusted sender user={uid} chat={msg.chat.id}")
         return
 
-    # Rate limit — ТОЛЬКО на реальный запрос (ссылка, не-админ).
-    # Сообщение о кулдауне шлём один раз за окно, чтобы не спамить чат.
+    url = urls[0]
+    chat_id = msg.chat.id
     user_id = msg.from_user.id if msg.from_user else None
+
+    # --- Анти-спам (только для идентифицируемых не-админов) ---
     if user_id is not None:
+        bkey = (chat_id, user_id)
+
+        # 1) Активный софт-бан → молча игнорируем.
+        if bkey in _banned:
+            logger.info(f"BANNED skip chat={chat_id} user={user_id}")
+            return
+
+        # 2) Повтор той же ссылки этим юзером → эскалация (без обработки и без rate-limit).
+        if (chat_id, user_id, url) in _dup_seen:
+            _dup_seen[(chat_id, user_id, url)] = True  # держим окно живым, пока спамят
+            await _handle_duplicate_spam(bot, msg, chat_id, user_id)
+            return
+
+        # 3) Общий пейсинг РАЗНЫХ ссылок. Дубли сюда не доходят.
         cooldown = _rate_cooldown(user_id)
         if cooldown:
             logger.info(f"RATE_LIMIT user={user_id} cooldown={cooldown}s")
@@ -271,14 +313,16 @@ async def handle(msg: Message, bot: Bot):
                 await msg.reply(f"⏳ Зачекайте {cooldown} сек. перед наступним запитом.")
             return
 
-    url = urls[0]
+        # Принимаем в работу → помечаем (chat,user,url) обслуженным.
+        _dup_seen[(chat_id, user_id, url)] = True
+
     screenshot.log_ram("Start request")
 
     if not security.is_safe(url):
         await msg.reply("🚫 Посилання веде на недоступний ресурс.")
         return
 
-    # Cache check — все типы включая negative
+    # Cache check — все типы включая negative.
     entry = cache.get(url)
     if entry:
         kind = entry.get("kind")
@@ -289,15 +333,17 @@ async def handle(msg: Message, bot: Bot):
                 f"Спробуйте через декілька хвилин."
             )
             return
-        # Кэш-хит (успех): шлём превью повторно — новому спрашивающему нужно его увидеть.
         await _send_from_cache(msg, url, entry)
         return
 
-    # Cache miss — в очередь. Ключ дедупа учитывает чат и топик.
-    dest_key = (msg.chat.id, msg.message_thread_id, url)
+    # Cache miss — в очередь. Ключ дедупа очереди — (chat, thread, url).
+    dest_key = (chat_id, msg.message_thread_id, url)
     try:
         future, position, is_duplicate = await queue_manager.enqueue(dest_key, url)
     except queue_manager.QueueFull:
+        # Не штрафуем за переполнение очереди — снимаем отметку, пусть повторят.
+        if user_id is not None:
+            _dup_seen.pop((chat_id, user_id, url), None)
         await msg.reply(
             "⚠️ Бот зараз перевантажений (черга заповнена).\n"
             "Будь ласка, спробуйте через хвилину."
@@ -305,10 +351,8 @@ async def handle(msg: Message, bot: Bot):
         return
 
     if is_duplicate:
-        # Этот URL уже обрабатывается для ЭТОГО чата/топика. Оригинальный запрос сам
-        # пришлёт скриншот сюда. Дубль НЕ дублируем (иначе N копий → Flood control),
-        # а реагируем 👀 на сообщение: «побачив, результат буде нижче».
-        logger.info(f"DUPLICATE inflight url={url} chat={msg.chat.id} thread={msg.message_thread_id} — react 👀")
+        # Тот же URL уже в работе для этого чата/топика (от другого запроса) → 👀.
+        logger.info(f"INFLIGHT dup url={url} chat={chat_id} thread={msg.message_thread_id} — react 👀")
         await _react(bot, msg, "👀")
         return
 
