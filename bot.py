@@ -1,9 +1,14 @@
 import re, time, asyncio
 from datetime import datetime, timezone
-from aiogram import Router, BaseMiddleware
-from aiogram.types import Message, BufferedInputFile, MessageEntity, InputMediaPhoto, TelegramObject
+from aiogram import Router, BaseMiddleware, Bot
+from aiogram.types import (
+    Message, BufferedInputFile, MessageEntity, InputMediaPhoto,
+    TelegramObject, ChatMemberUpdated,
+)
 from typing import Any, Callable, Awaitable
+from cachetools import TTLCache
 from loguru import logger
+from config import ALLOWED_GROUP_ID
 import cache, security, screenshot, metadata, queue_manager
 
 router = Router()
@@ -40,6 +45,65 @@ class RateLimitMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 router.message.middleware(RateLimitMiddleware())
+
+# --- Привязка к группе + доверие админам ---
+# Кэш админов: chat_id → set(user_ids). TTL 5 мин — состав админов меняется редко,
+# но один get_chat_administrators раз в 5 мин дешевле, чем API на каждое сообщение.
+_admin_cache: TTLCache = TTLCache(maxsize=64, ttl=300)
+
+async def _get_admin_ids(bot: Bot, chat_id: int) -> set[int]:
+    cached = _admin_cache.get(chat_id)
+    if cached is not None:
+        return cached
+    try:
+        admins = await bot.get_chat_administrators(chat_id)
+        ids = {a.user.id for a in admins if a.user}
+        _admin_cache[chat_id] = ids  # кешируем ТОЛЬКО успех
+        return ids
+    except Exception as e:
+        # На ошибке не считаем никого админом и НЕ кешируем: ссылку проверим
+        # (безопасный дефолт), а на следующем сообщении повторим запрос.
+        logger.warning(f"get_chat_administrators failed chat={chat_id}: {e}")
+        return set()
+
+async def _is_trusted_sender(bot: Bot, msg: Message) -> bool:
+    """True → отправитель доверенный (админ), ссылку не проверяем."""
+    # Анонимный админ постит от имени самой группы (sender_chat == chat).
+    if msg.sender_chat and msg.sender_chat.id == msg.chat.id:
+        return True
+    # Понятие «админ» есть только в группах/супергруппах.
+    if msg.chat.type not in ("group", "supergroup"):
+        return False
+    if not msg.from_user:
+        return False
+    return msg.from_user.id in await _get_admin_ids(bot, msg.chat.id)
+
+@router.my_chat_member()
+async def on_my_chat_member(event: ChatMemberUpdated, bot: Bot):
+    """
+    Срабатывает когда меняется членство САМОГО бота (добавили/удалили/повысили).
+    Штатный способ ловить добавление в чат — точнее и дешевле проверки на сообщениях.
+    Лог chat_id здесь же используется для первичной настройки ALLOWED_GROUP_ID.
+    """
+    chat = event.chat
+    status = event.new_chat_member.status  # member / administrator / restricted / left / kicked
+    logger.info(f"MY_CHAT_MEMBER chat_id={chat.id} type={chat.type} title={chat.title!r} status={status}")
+
+    # ID не задан → ограничение выключено, ниоткуда не выходим (но лог выше есть).
+    if not ALLOWED_GROUP_ID:
+        return
+
+    # В личке выйти нельзя (leave_chat только для групп/каналов) — игнорируем.
+    if chat.type == "private":
+        return
+
+    present = status in ("member", "administrator", "restricted")
+    if present and chat.id != ALLOWED_GROUP_ID:
+        logger.warning(f"LEAVE non-allowed chat_id={chat.id} (allowed={ALLOWED_GROUP_ID})")
+        try:
+            await bot.leave_chat(chat.id)
+        except Exception as e:
+            logger.error(f"leave_chat failed chat={chat.id}: {e}")
 
 # --- Сообщения ---
 WARNING_INSTANT = (
@@ -177,15 +241,34 @@ async def _send_from_cache(msg: Message, url: str, entry: dict):
         await msg.reply(text=msg_text, entities=msg_entities)
 
 @router.message()
-async def handle(msg: Message):
+async def handle(msg: Message, bot: Bot):
     age = (datetime.now(timezone.utc) - msg.date).total_seconds()
     if age > MAX_MSG_AGE:
         logger.info(f"SKIP stale msg age={age:.0f}s chat={msg.chat.id}")
         return
 
+    # Привязка к группе: если ID задан и это другой чат — не обрабатываем.
+    # Для групп ещё и выходим (страховка, если my_chat_member не сработал).
+    if ALLOWED_GROUP_ID and msg.chat.id != ALLOWED_GROUP_ID:
+        if msg.chat.type in ("group", "supergroup", "channel"):
+            logger.warning(f"Message in non-allowed chat {msg.chat.id} — leaving")
+            try:
+                await bot.leave_chat(msg.chat.id)
+            except Exception as e:
+                logger.warning(f"leave_chat failed: {e}")
+        return
+
     text = msg.text or msg.caption or ""
     urls = URL_RE.findall(text)
     if not urls:
+        return
+
+    # Доверие админам: ссылка от админа группы считается доверенной — пропускаем
+    # без проверки и без ответа. Проверяем ТОЛЬКО когда в сообщении есть ссылка,
+    # чтобы не дёргать API на каждое сообщение.
+    if await _is_trusted_sender(bot, msg):
+        uid = msg.from_user.id if msg.from_user else "anon"
+        logger.info(f"SKIP trusted sender user={uid} chat={msg.chat.id}")
         return
 
     url = urls[0]
