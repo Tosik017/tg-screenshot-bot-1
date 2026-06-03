@@ -17,6 +17,8 @@ _pw = None  # держим playwright-инстанс чтобы корректн
 _request_count = 0
 RESTART_EVERY = 50
 
+DEVICE_SCALE = 2  # ретина-качество скриншота (физ. px = логич. × DEVICE_SCALE)
+
 MOBILE_WIDTH = 390
 MOBILE_HEIGHT = 844
 
@@ -26,8 +28,15 @@ PART_HEIGHT = 1280
 # Скільки повних частин максимум обробляємо — захист від OOM на Render Free (512 МБ)
 MAX_PARTS = 4
 
-# Гранична висота: PART_HEIGHT × MAX_PARTS рівно без хвостика
-MAX_HEIGHT = PART_HEIGHT * MAX_PARTS  # 1280 × 4 = 5120 px
+# Гранична фізична висота: PART_HEIGHT × MAX_PARTS рівно без хвостика
+MAX_HEIGHT = PART_HEIGHT * MAX_PARTS  # 1280 × 4 = 5120 px (фізичні, вже з DEVICE_SCALE)
+
+# Гранична висота ЗАХВАТУ в CSS px = MAX_HEIGHT / DEVICE_SCALE.
+# КЛЮЧОВЕ: обмежуємо висоту ТУТ, на рівні браузера, а не постфактум у Pillow.
+# full_page=True змушує Chromium відрендерити ВСЮ сторінку в один битмап ще до
+# повернення байтів; на лістингах (hotline.ua) це десятки тисяч px → OOM на 512 МБ.
+# 5120 / 2 = 2560 CSS px.
+MAX_CAPTURE_HEIGHT = MAX_HEIGHT // DEVICE_SCALE
 
 COOKIE_SELECTORS = [
     "button[id*='accept']",
@@ -122,12 +131,13 @@ def _split_image(png_bytes: bytes) -> list[bytes]:
     """
     Розумна нарізка через Pillow.
     Робить з одного великого PNG список частин по PART_HEIGHT пікселів.
-    Максимальна висота обмежена MAX_HEIGHT = PART_HEIGHT × MAX_PARTS — захист від OOM.
+    Захват уже обмежений MAX_CAPTURE_HEIGHT на рівні браузера, тож crop тут —
+    лише страховка (фактично не спрацьовує).
     """
     img = Image.open(BytesIO(png_bytes))
     width, height = img.size
 
-    # Захист від величезних сторінок (50000+ px зустрічаються)
+    # Страховка: якщо раптом більше MAX_HEIGHT — обрізаємо.
     if height > MAX_HEIGHT:
         img = img.crop((0, 0, width, MAX_HEIGHT))
         height = MAX_HEIGHT
@@ -155,8 +165,10 @@ def _split_image(png_bytes: bytes) -> list[bytes]:
 async def shoot(url: str) -> tuple[list[bytes], dict]:
     """
     Повертає (список частин скриншота, метадані).
-    full_page=True — знімаємо всю сторінку.
-    Потім ріжемо через Pillow — без проблем з координатами браузера.
+    Захоплюємо ОБМЕЖЕНУ висоту на рівні браузера (НЕ full_page):
+    full_page рендерить всю сторінку в один битмап ДО повернення байтів —
+    на довгих лістингах (hotline.ua) це десятки тисяч px → OOM на 512 МБ.
+    Обрізка в Pillow тут не рятує: пам'ять вже вибухнула в браузері.
     """
     global _request_count
 
@@ -171,7 +183,7 @@ async def shoot(url: str) -> tuple[list[bytes], dict]:
         ctx = await _browser.new_context(
             viewport={"width": MOBILE_WIDTH, "height": MOBILE_HEIGHT},
             user_agent=USER_AGENT,
-            device_scale_factor=2,
+            device_scale_factor=DEVICE_SCALE,
         )
         try:
             page = await ctx.new_page()
@@ -194,9 +206,22 @@ async def shoot(url: str) -> tuple[list[bytes], dict]:
                 f"price={browser_meta.get('price')}"
             )
 
-            # Повна сторінка одним знімком
+            # Висота документа (CSS px). Обмежуємо захват зверху до MAX_CAPTURE_HEIGHT,
+            # щоб Chromium НЕ рендерив гігантський битмап (це і є причина OOM).
+            doc_height = await page.evaluate(
+                "Math.max(document.body.scrollHeight, document.documentElement.scrollHeight, "
+                "document.body.offsetHeight, document.documentElement.offsetHeight)"
+            )
+            capture_h = min(max(int(doc_height), MOBILE_HEIGHT), MAX_CAPTURE_HEIGHT)
+            logger.info(f"Capture height: doc={int(doc_height)} → clamp={capture_h} CSS px")
+
+            # Розширюємо viewport рівно на висоту захвату і знімаємо БЕЗ full_page.
+            # Скриншот viewport = битмап рівно MOBILE_WIDTH × capture_h × DEVICE_SCALE —
+            # пам'ять обмежена і не залежить від реальної довжини сторінки.
+            await page.set_viewport_size({"width": MOBILE_WIDTH, "height": capture_h})
+            await page.wait_for_timeout(500)  # reflow після зміни viewport
+
             full_png = await page.screenshot(
-                full_page=True,
                 animations="disabled",
                 timeout=20_000
             )
