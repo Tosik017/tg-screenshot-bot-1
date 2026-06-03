@@ -8,7 +8,7 @@ from aiogram.types import (
 from typing import Any, Callable, Awaitable
 from cachetools import TTLCache
 from loguru import logger
-from config import ALLOWED_GROUP_ID
+from config import ALLOWED_GROUP_IDS
 import cache, security, screenshot, metadata, queue_manager
 
 router = Router()
@@ -39,14 +39,18 @@ class RateLimitMiddleware(BaseMiddleware):
         if now - last < RATE_LIMIT_SEC:
             remaining = int(RATE_LIMIT_SEC - (now - last)) + 1
             logger.info(f"RATE_LIMIT user={user_id} cooldown={RATE_LIMIT_SEC - (now - last):.1f}s")
-            await event.reply(f"⏳ Зачекайте {remaining} сек. перед наступним запитом.")
+            # message_thread_id — чтобы ответ попал в тот же топик форум-группы
+            await event.reply(
+                f"⏳ Зачекайте {remaining} сек. перед наступним запитом.",
+                message_thread_id=event.message_thread_id,
+            )
             return
         _rate_store[user_id] = now
         return await handler(event, data)
 
 router.message.middleware(RateLimitMiddleware())
 
-# --- Привязка к группе + доверие админам ---
+# --- Привязка к группам + доверие админам ---
 # Кэш админов: chat_id → set(user_ids). TTL 5 мин — состав админов меняется редко,
 # но один get_chat_administrators раз в 5 мин дешевле, чем API на каждое сообщение.
 _admin_cache: TTLCache = TTLCache(maxsize=64, ttl=300)
@@ -83,14 +87,15 @@ async def on_my_chat_member(event: ChatMemberUpdated, bot: Bot):
     """
     Срабатывает когда меняется членство САМОГО бота (добавили/удалили/повысили).
     Штатный способ ловить добавление в чат — точнее и дешевле проверки на сообщениях.
-    Лог chat_id здесь же используется для первичной настройки ALLOWED_GROUP_ID.
+    Лог chat_id здесь же используется для первичной настройки ALLOWED_GROUP_IDS.
+    Топики роли не играют: chat.id один на всю форум-супергруппу.
     """
     chat = event.chat
     status = event.new_chat_member.status  # member / administrator / restricted / left / kicked
     logger.info(f"MY_CHAT_MEMBER chat_id={chat.id} type={chat.type} title={chat.title!r} status={status}")
 
-    # ID не задан → ограничение выключено, ниоткуда не выходим (но лог выше есть).
-    if not ALLOWED_GROUP_ID:
+    # Список не задан → ограничение выключено, ниоткуда не выходим (но лог выше есть).
+    if not ALLOWED_GROUP_IDS:
         return
 
     # В личке выйти нельзя (leave_chat только для групп/каналов) — игнорируем.
@@ -98,8 +103,8 @@ async def on_my_chat_member(event: ChatMemberUpdated, bot: Bot):
         return
 
     present = status in ("member", "administrator", "restricted")
-    if present and chat.id != ALLOWED_GROUP_ID:
-        logger.warning(f"LEAVE non-allowed chat_id={chat.id} (allowed={ALLOWED_GROUP_ID})")
+    if present and chat.id not in ALLOWED_GROUP_IDS:
+        logger.warning(f"LEAVE non-allowed chat_id={chat.id} (allowed={sorted(ALLOWED_GROUP_IDS)})")
         try:
             await bot.leave_chat(chat.id)
         except Exception as e:
@@ -216,6 +221,7 @@ async def _send_from_cache(msg: Message, url: str, entry: dict):
     """Отправляет ответ из кэша по типу записи. Метаданные уже в entry — никаких httpx."""
     kind = entry.get("kind")
     meta = entry.get("meta") or {}
+    thread_id = msg.message_thread_id  # тот же топик форум-группы
 
     if meta and meta.get("title"):
         msg_text, msg_entities = build_message(meta)
@@ -228,6 +234,7 @@ async def _send_from_cache(msg: Message, url: str, entry: dict):
             photo=entry["file_id"],
             caption=cap_text,
             caption_entities=cap_entities,
+            message_thread_id=thread_id,
         )
     elif kind == "media_group":
         media = []
@@ -236,9 +243,9 @@ async def _send_from_cache(msg: Message, url: str, entry: dict):
                 media.append(InputMediaPhoto(media=fid, caption=cap_text, caption_entities=cap_entities))
             else:
                 media.append(InputMediaPhoto(media=fid))
-        await msg.reply_media_group(media=media)
+        await msg.reply_media_group(media=media, message_thread_id=thread_id)
     elif kind == "text":
-        await msg.reply(text=msg_text, entities=msg_entities)
+        await msg.reply(text=msg_text, entities=msg_entities, message_thread_id=thread_id)
 
 @router.message()
 async def handle(msg: Message, bot: Bot):
@@ -247,9 +254,9 @@ async def handle(msg: Message, bot: Bot):
         logger.info(f"SKIP stale msg age={age:.0f}s chat={msg.chat.id}")
         return
 
-    # Привязка к группе: если ID задан и это другой чат — не обрабатываем.
+    # Привязка к группам: если список задан и это другой чат — не обрабатываем.
     # Для групп ещё и выходим (страховка, если my_chat_member не сработал).
-    if ALLOWED_GROUP_ID and msg.chat.id != ALLOWED_GROUP_ID:
+    if ALLOWED_GROUP_IDS and msg.chat.id not in ALLOWED_GROUP_IDS:
         if msg.chat.type in ("group", "supergroup", "channel"):
             logger.warning(f"Message in non-allowed chat {msg.chat.id} — leaving")
             try:
@@ -272,10 +279,11 @@ async def handle(msg: Message, bot: Bot):
         return
 
     url = urls[0]
+    thread_id = msg.message_thread_id  # тот же топик форум-группы во всех ответах
     screenshot.log_ram("Start request")
 
     if not security.is_safe(url):
-        await msg.reply("🚫 Посилання веде на недоступний ресурс.")
+        await msg.reply("🚫 Посилання веде на недоступний ресурс.", message_thread_id=thread_id)
         return
 
     # Cache check — все типы включая negative
@@ -287,7 +295,8 @@ async def handle(msg: Message, bot: Bot):
             await msg.reply(
                 f"🚫 Сторінка недоступна.\n"
                 f"Причина: {entry.get('failure_reason', 'unknown')}\n"
-                f"Спробуйте через декілька хвилин."
+                f"Спробуйте через декілька хвилин.",
+                message_thread_id=thread_id,
             )
             return
         # Успешный кэш: photo / media_group / text — отвечаем мгновенно
@@ -300,11 +309,12 @@ async def handle(msg: Message, bot: Bot):
     except queue_manager.QueueFull:
         await msg.reply(
             "⚠️ Бот зараз перевантажений (черга заповнена).\n"
-            "Будь ласка, спробуйте через хвилину."
+            "Будь ласка, спробуйте через хвилину.",
+            message_thread_id=thread_id,
         )
         return
 
-    status = await msg.reply(_format_warning(position, is_duplicate))
+    status = await msg.reply(_format_warning(position, is_duplicate), message_thread_id=thread_id)
     start = time.monotonic()
 
     httpx_task = asyncio.create_task(metadata.fetch(url))
@@ -338,6 +348,7 @@ async def handle(msg: Message, bot: Bot):
                     photo=BufferedInputFile(parts[0], filename="preview.png"),
                     caption=cap_text,
                     caption_entities=cap_entities,
+                    message_thread_id=thread_id,
                 )
                 if sent.photo:
                     cache.save_photo(url, sent.photo[-1].file_id, meta)
@@ -354,7 +365,7 @@ async def handle(msg: Message, bot: Bot):
                         media.append(InputMediaPhoto(
                             media=BufferedInputFile(part, filename=f"part_{i+1}.png"),
                         ))
-                sent_list = await msg.reply_media_group(media=media)
+                sent_list = await msg.reply_media_group(media=media, message_thread_id=thread_id)
                 if sent_list:
                     file_ids = [s.photo[-1].file_id for s in sent_list if s.photo]
                     if file_ids:
@@ -363,7 +374,7 @@ async def handle(msg: Message, bot: Bot):
             logger.info(f"OK+photo parts={len(parts)} url={url} time={elapsed:.1f}s")
         else:
             # Скриншот не получился — кэшируем как text_only
-            await msg.reply(text=msg_text, entities=msg_entities)
+            await msg.reply(text=msg_text, entities=msg_entities, message_thread_id=thread_id)
             if meta and meta.get("title"):
                 cache.save_text_only(url, meta)
             else:
