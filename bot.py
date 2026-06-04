@@ -7,7 +7,7 @@ from aiogram.types import (
 )
 from cachetools import TTLCache
 from loguru import logger
-from config import ALLOWED_GROUP_IDS, ALLOWED_THREAD_ID
+from config import ALLOWED_GROUP_IDS, DISABLED_THREADS, DISABLED_GENERAL_CHATS
 import cache, security, screenshot, metadata, queue_manager
 
 # aiogram 3.7: msg.reply* сами проставляют message_thread_id из исходного
@@ -290,6 +290,12 @@ async def _send_from_cache(msg: Message, url: str, entry: dict):
     elif kind == "text":
         await msg.reply(text=msg_text, entities=msg_entities)
 
+def _thread_disabled(chat_id: int, thread_id) -> bool:
+    """Этот топик ЭТОЙ группы в denylist? General = сообщения без топика (thread_id is None)."""
+    if thread_id is None:
+        return chat_id in DISABLED_GENERAL_CHATS
+    return (chat_id, thread_id) in DISABLED_THREADS
+
 @router.message()
 async def handle(msg: Message, bot: Bot):
     age = (datetime.now(timezone.utc) - msg.date).total_seconds()
@@ -306,10 +312,10 @@ async def handle(msg: Message, bot: Bot):
                 logger.warning(f"leave_chat failed: {e}")
         return
 
-    # Фильтр топика — ПОВЕРХ фильтра группы, не вместо. Стоит ПОСЛЕ него, чтобы
-    # из чужих групп бот всё равно выходил. Сообщения вне нужного топика молча
-    # игнорируем (в т.ч. General: там message_thread_id = None != ALLOWED_THREAD_ID).
-    if ALLOWED_THREAD_ID and msg.message_thread_id != ALLOWED_THREAD_ID:
+    # Denylist топиков (пара группа+топик) — ПОВЕРХ фильтра группы, не вместо. Стоит
+    # ПОСЛЕ него, чтобы из чужих групп бот всё равно выходил. В отключённых топиках бот
+    # полностью молчит (ни проверок, ни реакций). General = thread_id is None.
+    if _thread_disabled(msg.chat.id, msg.message_thread_id):
         return
 
     text = msg.text or msg.caption or ""
