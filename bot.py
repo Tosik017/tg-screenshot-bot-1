@@ -267,6 +267,43 @@ def _format_warning(position: int) -> str:
         "⏳ Не переходьте, дочекайтесь результату нижче. 👇"
     )
 
+def _utf16_len(s: str) -> int:
+    """Длина строки в UTF-16 единицах — Telegram считает offset/length именно так."""
+    return len(s.encode("utf-16-le")) // 2
+
+def _sender_prefix(msg: Message) -> tuple[str, list[MessageEntity]]:
+    """
+    Атрибуция отправителя В ТЕЛЕ карточки. Переживает удаление исходного сообщения
+    (раньше отправитель был виден только в reply-цитате → пропадал при удалении).
+    - Есть @username → обычный текст @username: Telegram сам делает кликабельным,
+      entity не нужна, отправка не может сломаться.
+    - Нет @username → text_mention (единственный способ дать кликабельную ссылку
+      без username; для участника чата, который только что писал, работает надёжно).
+    """
+    user = msg.from_user
+    if not user:
+        return "", []
+    label = "👤 Надіслав: "
+    if user.username:
+        return f"{label}@{user.username}\n\n", []
+    name = (user.full_name or "Користувач").strip() or "Користувач"
+    ent = MessageEntity(
+        type="text_mention",
+        offset=_utf16_len(label),
+        length=_utf16_len(name),
+        user=user,
+    )
+    return f"{label}{name}\n\n", [ent]
+
+def _with_sender(msg: Message, text: str, entities: list) -> tuple[str, list]:
+    """Дописывает атрибуцию отправителя в начало карточки, сдвигая offset'ы карточки."""
+    prefix, prefix_ents = _sender_prefix(msg)
+    if not prefix:
+        return text, entities
+    shift = _utf16_len(prefix)
+    shifted = [e.model_copy(update={"offset": e.offset + shift}) for e in entities]
+    return prefix + text, prefix_ents + shifted
+
 async def _send_from_cache(msg: Message, url: str, entry: dict):
     kind = entry.get("kind")
     meta = entry.get("meta") or {}
@@ -275,6 +312,7 @@ async def _send_from_cache(msg: Message, url: str, entry: dict):
         msg_text, msg_entities = build_message(meta)
     else:
         msg_text, msg_entities = build_disclaimer_only()
+    msg_text, msg_entities = _with_sender(msg, msg_text, msg_entities)
     cap_text, cap_entities = trim_caption(msg_text, msg_entities)
 
     if kind == "photo":
@@ -413,6 +451,7 @@ async def handle(msg: Message, bot: Bot):
         msg_text, msg_entities = build_message(meta)
     else:
         msg_text, msg_entities = build_disclaimer_only()
+    msg_text, msg_entities = _with_sender(msg, msg_text, msg_entities)
 
     try:
         if parts:
