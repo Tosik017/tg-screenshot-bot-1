@@ -29,6 +29,29 @@ ALLOWED_GROUP_IDS = _parse_group_ids(
     os.environ.get("ALLOWED_GROUP_ID", ""),
 )
 
+def _parse_thread_id(raw: str) -> int:
+    """
+    ID топика (форум-темы), в котором боту разрешено работать.
+    0 = ВЫКЛЮЧЕНО (бот работает во всех топиках разрешённых групп — старое поведение).
+    Битое значение НЕ роняет бот: логируем и считаем 0 (выключено).
+    Ставится ПОВЕРХ фильтра по группе, не вместо: сначала проверяется группа,
+    потом топик. Чужая группа с тем же thread_id всё равно отсекается фильтром группы.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return 0
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"[config] WARN: некорректный ALLOWED_THREAD_ID={raw!r} — игнорирую (0)")
+        return 0
+
+# Один разрешённый топик форум-супергруппы. Пусто/0 = ограничение по топику выключено.
+# ВНИМАНИЕ: если группа НЕ форумная (топики выключены), у всех сообщений
+# message_thread_id = None — при заданном ALLOWED_THREAD_ID бот замолчит везде.
+# Поэтому задавать только для форум-групп.
+ALLOWED_THREAD_ID = _parse_thread_id(os.environ.get("ALLOWED_THREAD_ID", "0"))
+
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 TIMEOUT_MS = 20_000  # 20 секунд — баланс між швидкістю і надійністю
 PAUSE_MS = 3_000

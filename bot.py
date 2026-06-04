@@ -7,7 +7,7 @@ from aiogram.types import (
 )
 from cachetools import TTLCache
 from loguru import logger
-from config import ALLOWED_GROUP_IDS
+from config import ALLOWED_GROUP_IDS, ALLOWED_THREAD_ID
 import cache, security, screenshot, metadata, queue_manager
 
 # aiogram 3.7: msg.reply* сами проставляют message_thread_id из исходного
@@ -304,6 +304,12 @@ async def handle(msg: Message, bot: Bot):
                 await bot.leave_chat(msg.chat.id)
             except Exception as e:
                 logger.warning(f"leave_chat failed: {e}")
+        return
+
+    # Фильтр топика — ПОВЕРХ фильтра группы, не вместо. Стоит ПОСЛЕ него, чтобы
+    # из чужих групп бот всё равно выходил. Сообщения вне нужного топика молча
+    # игнорируем (в т.ч. General: там message_thread_id = None != ALLOWED_THREAD_ID).
+    if ALLOWED_THREAD_ID and msg.message_thread_id != ALLOWED_THREAD_ID:
         return
 
     text = msg.text or msg.caption or ""

@@ -1,6 +1,7 @@
 import httpx, json
 from selectolax.parser import HTMLParser
 from loguru import logger
+import security  # SSRF: проверка финального адреса после редиректов
 
 USER_AGENTS = [
     "Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)",
@@ -21,6 +22,18 @@ async def fetch(url: str) -> dict:
             }
             async with httpx.AsyncClient(follow_redirects=True, timeout=8) as client:
                 r = await client.get(url, headers=headers)
+
+            # SSRF после редиректов: ссылка могла перенаправить на внутренний/служебный
+            # адрес. Проверяем КУДА реально пришли. Приватный финальный хост → не отдаём
+            # метаданные (внутренняя страница не утечёт в карточку). is_safe возвращает
+            # False и на резолв-ошибке — безопасный дефолт.
+            # Прим.: сам GET к финальному хосту уже выполнен; перехват ДО запроса
+            # (hop-by-hop) сознательно НЕ берём — он трогает hot-path и ломает легит-редиректы.
+            final_url = str(r.url)
+            if final_url != url and not security.is_safe(final_url):
+                logger.warning(f"SSRF blocked redirect url={url} -> final={final_url}")
+                return {}
+
             result = _parse(r.text, url)
             if result.get("title") and result["title"] not in ("", url):
                 logger.info(f"Metadata OK ua={ua[:30]} url={url}")
